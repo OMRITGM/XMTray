@@ -42,6 +42,7 @@ struct App final : AppHost {
     bool wasVisible = false;
     ULONGLONG graceUntil = 0, refreshUntil = 0, lastReadyAt = 0, lastAttemptAt = 0, lastRefreshAt = 0;
     bool lowNotified = false;
+    int pendingDolbyMode = -1; // mode asked of Dolby Access, until the asynchronous switch reports back
     bool demo = false; // --demo: no Bluetooth, a fake headphone, commands applied locally (UI testing)
 
     void StartDemo() {
@@ -173,23 +174,38 @@ struct App final : AppHost {
             if (!target.empty() && e.btMac == target) return e.id;
         return {};
     }
-    // Spatial sound is per output device: only ever look at / change the selected headphone's own endpoint.
-    // (Demo mode has no such endpoint; it shows this PC's default output read-only so the page looks real.)
+    // Spatial sound is per output device: only ever look at / change the selected headphone's own endpoint,
+    // and Dolby Access always acts on the Windows default output, so mode switching needs it to be that output.
+    bool TargetIsDefaultOutput() const {
+        for (const Endpoint& e : endpoints)
+            if (!target.empty() && e.btMac == target) return e.isDefault;
+        return false;
+    }
     DolbyState DolbyStatus() override {
-        const std::wstring id = TargetEndpoint();
-        DolbyState s = dolby->Get(id);
-        if (id.empty()) {
-            s.canToggle = false;
-            if (!demo) {
-                s.statusKnown = s.spatialOn = s.atmosOn = s.canSetMode = false;
-                s.formatName.clear();
-                s.note = L"The selected headphones are not a Windows audio output right now. Connect them in Windows "
-                         L"to see and change spatial sound.";
-            }
-        } else {
-            for (const Endpoint& e : endpoints)
-                if (e.id == id) s.endpointName = e.name;
+        if (demo) { // demo never queries the system: a fixed, honest picture of the page with Atmos off
+            DolbyState s;
+            s.appInstalled = s.statusKnown = true;
+            s.formatName = L"Off";
+            s.endpointName = L"Headphones (demo)";
+            s.note = L"Demo mode: spatial sound is not read or changed.";
+            return s;
         }
+        const std::wstring id = TargetEndpoint();
+        if (id.empty()) {
+            DolbyState s;
+            s.appInstalled = dolby->Get(L"").appInstalled;
+            s.note = L"The selected headphones are not a Windows audio output right now. Connect them in Windows "
+                     L"to see and change spatial sound.";
+            return s;
+        }
+        DolbyState s = dolby->Get(id);
+        for (const Endpoint& e : endpoints)
+            if (e.id == id) s.endpointName = e.name;
+        if (s.canSetMode && !TargetIsDefaultOutput()) {
+            s.canSetMode = false;
+            s.note = L"Sound modes can be switched only while these headphones are the Windows output device.";
+        }
+        if (!s.modeBusy && pendingDolbyMode >= 0) FinishDolbyMode(s);
         return s;
     }
     void SetDolbyEnabled(bool on) override {
@@ -199,20 +215,32 @@ struct App final : AppHost {
         flyout->Refresh();
     }
     void SetDolbyMode(int mode) override {
-        const bool ok = !demo && !TargetEndpoint().empty() && dolby->SetMode(mode);
-        if (!ok) Log(L"dolby: mode switch %d not started", mode);
-        if (ok && cfg.resetEqOnDolbyMode && snap.link == Link::Ready && snap.hasEq && snap.eqBandCount > 0) {
-            Command c; // flat curve, so the Dolby tuning and the headphone EQ do not stack
-            c.kind = Command::SetEqBands;
-            c.a = snap.eqBandCount;
-            Send(c);
-            if (snap.hasClearBass) {
-                Command b;
-                b.kind = Command::SetClearBass;
-                Send(b);
-            }
-        }
+        if (demo || TargetEndpoint().empty() || !TargetIsDefaultOutput()) return;
+        if (dolby->Get(TargetEndpoint()).mode == mode) return; // already active: Dolby would log nothing to confirm
+        if (dolby->SetMode(mode)) pendingDolbyMode = mode; // asynchronous; FinishDolbyMode runs when it completes
+        else Log(L"dolby: mode switch %d not started", mode);
         flyout->Refresh();
+    }
+    // A mode switch finished. Only after a confirmed success: flatten the headphone EQ so the two tunings
+    // do not stack (clamped to the device range, and only if the headphones accept EQ changes right now).
+    void FinishDolbyMode(const DolbyState& s) {
+        const int wanted = pendingDolbyMode;
+        pendingDolbyMode = -1;
+        if (!s.modeError.empty() || s.mode != wanted) return;
+        if (!cfg.resetEqOnDolbyMode || snap.link != Link::Ready || !snap.hasEq || !snap.eqAvailable ||
+            snap.eqBandCount <= 0)
+            return;
+        Command c;
+        c.kind = Command::SetEqBands;
+        c.a = snap.eqBandCount;
+        c.bands.fill(std::clamp(0, snap.eqBandRange.min, snap.eqBandRange.max));
+        Send(c);
+        if (snap.hasClearBass) {
+            Command b;
+            b.kind = Command::SetClearBass;
+            b.a = std::clamp(0, snap.clearBassRange.min, snap.clearBassRange.max);
+            Send(b);
+        }
     }
     void OpenDolbyAccess() override {
         if (!demo && !dolby->OpenApp()) Log(L"dolby: could not open Dolby Access");

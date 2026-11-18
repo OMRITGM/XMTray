@@ -5,6 +5,7 @@
 #include <ole2.h>
 #include <shellapi.h>
 #include <shobjidl.h>
+#include <tlhelp32.h>
 #include <uiautomation.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Media.Audio.h>
@@ -18,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <thread>
 
 #pragma comment(lib, "oleaut32.lib") // BSTR / VARIANT helpers used with UI Automation
@@ -42,7 +44,10 @@ constexpr ULONGLONG kSetTimeoutMs = 15000;   // spatial format switch
 constexpr ULONGLONG kJobBudgetMs = 20000;    // whole UI Automation job
 constexpr ULONGLONG kStepTimeoutMs = 12000;  // waiting for the window / settings tab
 constexpr ULONGLONG kConfirmMs = 4000;
-constexpr DWORD kShutdownWaitMs = 5000;
+constexpr ULONGLONG kLateWindowMs = 3000;   // cleanup: wait for a launched window that appeared after a cancel
+// Destructor wait: covers the worst cleanup after a cancel (one in-flight UIA call, ≤3 s transaction timeout, plus
+// either the late-window wait or one restore UIA call, ≤3 s) with margin.
+constexpr DWORD kShutdownWaitMs = 10000;
 constexpr ULONGLONG kLogTail = 256 * 1024;
 
 struct KnownFormat { const wchar_t* guid; const wchar_t* name; };
@@ -66,10 +71,6 @@ bool EqualNoCase(const std::wstring& a, const wchar_t* b) {
 bool StartsNoCase(const std::wstring& a, const wchar_t* prefix) {
     const int n = static_cast<int>(wcslen(prefix));
     return static_cast<int>(a.size()) >= n && CompareStringOrdinal(a.c_str(), n, prefix, n, TRUE) == CSTR_EQUAL;
-}
-bool ContainsNoCase(const std::wstring& hay, const wchar_t* needle) {
-    return FindNLSStringEx(LOCALE_NAME_INVARIANT, FIND_FROMSTART | LINGUISTIC_IGNORECASE, hay.c_str(),
-                           static_cast<int>(hay.size()), needle, -1, nullptr, nullptr, nullptr, 0) >= 0;
 }
 
 // ---- installed check ---------------------------------------------------------------------------------------
@@ -202,79 +203,69 @@ int ProfileToMode(const std::wstring& name) {
     return -1;
 }
 
-// Profile name from one log line, if it is one of:
-//   ...::Selected profile: Music
-//   ...::Profile Music set or updated
-//   ...::Initial configuration restored from AppService. Active profile: Music
-std::optional<std::wstring> ProfileInLine(const std::wstring& line) {
-    auto token = [&](size_t at) {
-        size_t end = at;
-        while (end < line.size() && !iswspace(line[end])) ++end;
-        return line.substr(at, end - at);
-    };
+// Mode named by one log line, -1 if it is not a profile line or names an unknown profile. Authoritative lines:
+//   ...::Selected profile: Music                                                  (a switch, and app start)
+//   ...::Initial configuration restored from AppService. Active profile: Music    (app start; `withActive` only)
+// "Profile <X> set or updated" is not used: it also repeats while a profile's settings are edited.
+int ModeInLine(const std::wstring& line, bool withActive) {
     for (const wchar_t* key : {L"Selected profile: ", L"Active profile: "}) {
+        if (!withActive && key[0] == L'A') continue;
         const size_t p = line.rfind(key);
-        if (p != std::wstring::npos) return token(p + wcslen(key));
+        if (p == std::wstring::npos) continue;
+        size_t at = p + wcslen(key), end = at;
+        while (end < line.size() && !iswspace(line[end])) ++end;
+        return ProfileToMode(line.substr(at, end - at));
     }
-    const size_t tail = line.rfind(L" set or updated");
-    if (tail != std::wstring::npos) {
-        const size_t p = line.rfind(L"Profile ", tail);
-        if (p != std::wstring::npos) return line.substr(p + 8, tail - (p + 8));
-    }
-    return std::nullopt;
+    return -1;
 }
 
-// Last profile line in `text` -> mode (-1 if that profile is unknown); nullopt if there is none.
-std::optional<int> LastProfile(const std::wstring& text) {
-    size_t end = text.size();
-    while (end > 0) {
+// Calls fn(line) for each complete line of `text`, newest first (a final line without '\n' may still be being
+// written and is skipped). Stops when fn returns true.
+template <class Fn> bool EachLineBackward(const std::wstring& text, Fn fn) {
+    size_t end = text.rfind(L'\n');
+    while (end != std::wstring::npos && end > 0) {
         const size_t nl = text.rfind(L'\n', end - 1);
         const size_t begin = nl == std::wstring::npos ? 0 : nl + 1;
-        if (auto p = ProfileInLine(text.substr(begin, end - begin))) return ProfileToMode(*p);
-        if (nl == std::wstring::npos) break;
+        if (fn(text.substr(begin, end - begin))) return true;
         end = nl;
     }
-    return std::nullopt;
+    return false;
 }
 
 int ReadCurrentMode() {
     const auto files = LogFiles();
     std::wstring text;
-    for (size_t i = 0; i < files.size() && i < 3; ++i)
+    int mode = -1;
+    for (size_t i = 0; i < files.size() && i < 3 && mode < 0; ++i)
         if (ReadLogText(files[i], 0, text, nullptr))
-            if (auto m = LastProfile(text)) return *m;
-    return -1;
+            EachLineBackward(text, [&](const std::wstring& l) { return (mode = ModeInLine(l, true)) >= 0; });
+    return mode;
 }
 
-// True if a profile line for `mode` was written after byte `from` of `path`.
+// True if a "Selected profile: <mode>" line was written after byte `from` of `path`.
 bool LogConfirms(const std::wstring& path, ULONGLONG from, int mode) {
     std::wstring text;
     if (!ReadLogText(path, from, text, nullptr)) return false;
-    size_t begin = 0;
-    while (begin < text.size()) {
-        size_t nl = text.find(L'\n', begin);
-        if (nl == std::wstring::npos) nl = text.size();
-        if (auto p = ProfileInLine(text.substr(begin, nl - begin)); p && ProfileToMode(*p) == mode) return true;
-        begin = nl + 1;
-    }
-    return false;
+    return EachLineBackward(text, [&](const std::wstring& l) { return ModeInLine(l, false) == mode; });
 }
 
 // ---- state shared by the Dolby object and its worker thread --------------------------------------------------
 struct Shared {
     HWND notify = nullptr;
-    std::atomic<bool> cancel{false};
-    std::atomic<bool> dirty{false}; // Get() must drop its cache
+    std::atomic<bool> cancel{false};    // the Dolby object is being destroyed
+    std::atomic<bool> jobCancel{false}; // the running mode job should stop (SetAutomation(false)); reset per job
+    std::atomic<bool> dirty{false};     // Get() must drop its cache
     std::mutex m;
     std::condition_variable cv;
     bool running = false;    // a job thread is active
     bool toggleBusy = false;
     bool modeBusy = false;
-    bool denied = false;     // Windows explicitly refused a spatial format switch this session
-    std::wstring toggleNote; // why the last spatial format switch failed
+    std::set<std::wstring> denied; // endpoint ids where Windows answered AccessDenied this session
+    std::wstring toggleEndpoint;   // endpoint of the last spatial format switch
+    std::wstring toggleNote;       // why it failed; empty if it worked
     std::wstring modeError;
     int mode = -1;           // parsed from the Dolby Access log
-    ULONGLONG modeAt = 0;    // when `mode` was read; 0 = never
+    ULONGLONG modeAt = 0;    // when `mode` was read successfully; 0 = read again
 };
 
 void FinishJob(const std::shared_ptr<Shared>& sh, const std::function<void(Shared&)>& apply) {
@@ -294,8 +285,21 @@ struct ComInit {
 };
 
 // ---- job: switch the spatial sound format --------------------------------------------------------------------
+const wchar_t* StatusNote(wma::SetDefaultSpatialAudioFormatStatus s) {
+    using S = wma::SetDefaultSpatialAudioFormatStatus;
+    switch (s) {
+    case S::Succeeded: return L"";
+    case S::AccessDenied: return L"Windows did not allow XMTray to switch spatial sound for this output; use Dolby Access or Windows sound settings.";
+    case S::LicenseExpired: return L"The Dolby Atmos licence has expired — open Dolby Access.";
+    case S::LicenseNotValidForAudioEndpoint: return L"Dolby Atmos is not licensed for this output — open Dolby Access.";
+    case S::NotSupportedOnAudioEndpoint: return L"This output does not support that spatial sound format.";
+    default: return L"Windows could not switch spatial sound (unknown error).";
+    }
+}
+
 void RunToggle(std::shared_ptr<Shared> sh, std::wstring endpointId, bool on) {
-    bool denied = false;
+    using St = winrt::Windows::Foundation::AsyncStatus;
+    std::optional<wma::SetDefaultSpatialAudioFormatStatus> result;
     std::wstring note;
     {
         ComInit com;
@@ -306,20 +310,16 @@ void RunToggle(std::shared_ptr<Shared> sh, std::wstring endpointId, bool on) {
                     cfg.IsSpatialAudioFormatSupported(winrt::hstring(kAtmosHeadphones)) ? 1 : 0);
             auto op = cfg.SetDefaultSpatialAudioFormatAsync(winrt::hstring(on ? kAtmosHeadphones : kOffGuid));
             const ULONGLONG end = GetTickCount64() + kSetTimeoutMs;
-            auto st = winrt::Windows::Foundation::AsyncStatus::Started;
-            while ((st = op.wait_for(std::chrono::milliseconds(200))) == winrt::Windows::Foundation::AsyncStatus::Started &&
-                   !sh->cancel && GetTickCount64() < end) {}
-            if (st == winrt::Windows::Foundation::AsyncStatus::Started) {
+            St st = St::Started;
+            while ((st = op.wait_for(std::chrono::milliseconds(200))) == St::Started && !sh->cancel && GetTickCount64() < end) {}
+            if (st == St::Started) {
                 op.Cancel();
                 Log(L"Dolby: SetEnabled timed out or cancelled");
                 note = L"Windows did not finish switching spatial sound in time; try again or use Windows sound settings.";
-            } else if (st == winrt::Windows::Foundation::AsyncStatus::Completed) {
-                const auto status = op.GetResults().Status();
-                Log(L"Dolby: SetEnabled(%d) status %d", on ? 1 : 0, static_cast<int>(status));
-                if (status != wma::SetDefaultSpatialAudioFormatStatus::Succeeded) {
-                    denied = true;
-                    note = L"Windows did not allow XMTray to switch spatial sound; use Dolby Access or Windows sound settings.";
-                }
+            } else if (st == St::Completed) {
+                result = op.GetResults().Status();
+                Log(L"Dolby: SetEnabled(%d) status %d", on ? 1 : 0, static_cast<int>(*result));
+                note = StatusNote(*result);
             } else {
                 Log(L"Dolby: SetEnabled failed 0x%08X", static_cast<unsigned>(op.ErrorCode().value));
                 note = L"Switching spatial sound failed; try again or use Windows sound settings.";
@@ -334,8 +334,10 @@ void RunToggle(std::shared_ptr<Shared> sh, std::wstring endpointId, bool on) {
     }
     FinishJob(sh, [&](Shared& s) {
         s.toggleBusy = false;
+        s.toggleEndpoint = endpointId;
         s.toggleNote = note;
-        if (denied) s.denied = true;
+        if (result == wma::SetDefaultSpatialAudioFormatStatus::AccessDenied) s.denied.insert(endpointId);
+        else if (result == wma::SetDefaultSpatialAudioFormatStatus::Succeeded) s.denied.erase(endpointId);
     });
 }
 
@@ -352,10 +354,21 @@ bool IsDolbyProcess(DWORD pid) {
     return CompareStringOrdinal(slash ? slash + 1 : path, -1, L"DolbyAccess.exe", -1, TRUE) == CSTR_EQUAL;
 }
 
-bool IsDolbyWindow(HWND w) {
+std::set<DWORD> DolbyPids() {
+    std::set<DWORD> out;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return out;
+    PROCESSENTRY32W pe{sizeof pe};
+    for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe))
+        if (CompareStringOrdinal(pe.szExeFile, -1, L"DolbyAccess.exe", -1, TRUE) == CSTR_EQUAL) out.insert(pe.th32ProcessID);
+    CloseHandle(snap);
+    return out;
+}
+
+DWORD DolbyPidOf(HWND w) {
     DWORD pid = 0;
     GetWindowThreadProcessId(w, &pid);
-    return pid && IsDolbyProcess(pid);
+    return pid && IsDolbyProcess(pid) ? pid : 0;
 }
 
 bool HasClass(HWND w, const wchar_t* cls) {
@@ -363,22 +376,23 @@ bool HasClass(HWND w, const wchar_t* cls) {
     return GetClassNameW(w, buf, 64) && wcscmp(buf, cls) == 0;
 }
 
-// The ApplicationFrameWindow whose Windows.UI.Core.CoreWindow child belongs to DolbyAccess.exe. While the app is
-// minimised the CoreWindow is detached from its frame and becomes top-level; then the frame is the one without a
-// CoreWindow child whose title equals that CoreWindow's title (compared, not hard-coded: it is localised).
-HWND FindDolbyFrame() {
-    struct Ctx { HWND frame = nullptr; HWND looseCore = nullptr; std::vector<HWND> emptyFrames; } ctx;
+// The ApplicationFrameWindow whose Windows.UI.Core.CoreWindow child belongs to DolbyAccess.exe (`pid` = that
+// process). While the app is minimised the CoreWindow is detached from its frame and becomes top-level; then the
+// frame is the one without a CoreWindow child whose title equals that CoreWindow's title (compared, not
+// hard-coded: it is localised).
+HWND FindDolbyFrame(DWORD* pid) {
+    struct Ctx { HWND frame = nullptr; DWORD pid = 0; HWND looseCore = nullptr; DWORD loosePid = 0; std::vector<HWND> emptyFrames; } ctx;
     EnumWindows([](HWND top, LPARAM lp) -> BOOL {
         Ctx& c = *reinterpret_cast<Ctx*>(lp);
         if (HasClass(top, L"Windows.UI.Core.CoreWindow")) {
-            if (!c.looseCore && IsDolbyWindow(top)) c.looseCore = top;
+            if (!c.looseCore && (c.loosePid = DolbyPidOf(top)) != 0) c.looseCore = top;
             return TRUE;
         }
         if (!HasClass(top, L"ApplicationFrameWindow")) return TRUE;
         bool hasCore = false;
         for (HWND w = nullptr; (w = FindWindowExW(top, w, L"Windows.UI.Core.CoreWindow", nullptr)) != nullptr;) {
             hasCore = true;
-            if (IsDolbyWindow(w)) {
+            if ((c.pid = DolbyPidOf(w)) != 0) {
                 c.frame = top;
                 return FALSE;
             }
@@ -386,21 +400,24 @@ HWND FindDolbyFrame() {
         if (!hasCore) c.emptyFrames.push_back(top);
         return TRUE;
     }, reinterpret_cast<LPARAM>(&ctx));
+    *pid = ctx.pid;
     if (ctx.frame || !ctx.looseCore) return ctx.frame;
     wchar_t want[256] = L"", have[256];
     if (GetWindowTextW(ctx.looseCore, want, 256) == 0) return nullptr;
     for (HWND f : ctx.emptyFrames)
-        if (GetWindowTextW(f, have, 256) > 0 && wcscmp(have, want) == 0) return f;
+        if (GetWindowTextW(f, have, 256) > 0 && wcscmp(have, want) == 0) {
+            *pid = ctx.loosePid;
+            return f;
+        }
     return nullptr;
 }
 
 struct Bstr {
     BSTR b = nullptr;
     Bstr() = default;
-    explicit Bstr(const wchar_t* s) : b(SysAllocString(s)) {}
-    ~Bstr() { SysFreeString(b); }
     Bstr(const Bstr&) = delete;
     Bstr& operator=(const Bstr&) = delete;
+    ~Bstr() { SysFreeString(b); }
     std::wstring str() const { return b ? std::wstring(b, SysStringLen(b)) : std::wstring(); }
 };
 
@@ -409,7 +426,7 @@ struct Node {
     int depth = 0;
     CONTROLTYPEID type = 0;
     std::wstring id, name;
-    bool sel = false, inv = false, tog = false;
+    bool sel = false, inv = false, tog = false; // patterns (Invoke / Toggle only for the layout dump)
 };
 
 const wchar_t* TypeName(CONTROLTYPEID t) {
@@ -434,9 +451,18 @@ const wchar_t* TypeName(CONTROLTYPEID t) {
     }
 }
 
+constexpr wchar_t kLayoutErr[] = L"Dolby Access layout not recognised (app updated?)";
+
+// One mode switch. The destructor always puts the window back (and closes the app if this job started it), so
+// no exception or early return can leave Dolby Access off-screen.
 class ModeJob {
 public:
     ModeJob(std::shared_ptr<Shared> sh, int mode) : sh_(std::move(sh)), mode_(mode) {}
+    ModeJob(const ModeJob&) = delete;
+    ModeJob& operator=(const ModeJob&) = delete;
+    ~ModeJob() {
+        try { Restore(); } catch (...) {}
+    }
 
     // Returns "" on success, else a short reason for the user.
     std::wstring Run() {
@@ -444,10 +470,9 @@ public:
         if (err.empty()) err = PrepareWindow();
         if (err.empty()) err = StartUia();
         if (err.empty()) err = SelectSettingsTab();
-        com_ptr<IUIAutomationElement> target;
+        com_ptr<IUIAutomationSelectionItemPattern> target;
         if (err.empty()) err = FindModeControl(target);
         if (err.empty()) err = ActivateAndConfirm(target);
-        RestoreWindow();
         return err;
     }
 
@@ -455,62 +480,99 @@ private:
     std::shared_ptr<Shared> sh_;
     int mode_;
     ULONGLONG deadline_ = GetTickCount64() + kJobBudgetMs;
-    HWND frame_ = nullptr;
-    bool existed_ = false, launched_ = false, moved_ = false;
-    WINDOWPLACEMENT wp_{sizeof(WINDOWPLACEMENT)};
     HWND fg_ = GetForegroundWindow();
+    std::set<DWORD> before_;    // DolbyAccess.exe processes running before we did anything
+    HWND frame_ = nullptr;
+    bool existed_ = false;      // the window was there before
+    bool launched_ = false;     // we called ActivateApplication
+    bool ours_ = false;         // ... and it started a new process: close it afterwards
+    bool moved_ = false;        // the window has been moved / un-minimised and must be put back
+    bool wasIconic_ = false;
+    RECT rect_{};               // pre-existing normal window: exact rect (placement loses snapped positions)
+    WINDOWPLACEMENT wp_{sizeof(WINDOWPLACEMENT)};
     com_ptr<IUIAutomation> uia_;
     com_ptr<IUIAutomationElement> root_;
+    com_ptr<IUIAutomationSelectionItemPattern> prevNav_; // nav item to re-select in a pre-existing window
+
+    bool Cancelled() const { return sh_->cancel || sh_->jobCancel; }
 
     // Poll `done` every `stepMs` until it returns true, `timeoutMs` passes, the job budget ends or we are cancelled.
     std::wstring Poll(ULONGLONG timeoutMs, DWORD stepMs, const std::function<bool()>& done, const wchar_t* timeoutErr) {
         const ULONGLONG end = std::min(GetTickCount64() + timeoutMs, deadline_);
         for (;;) {
-            if (sh_->cancel) return L"Cancelled";
+            if (Cancelled()) return L"Cancelled";
             if (done()) return {};
             if (GetTickCount64() >= end) return GetTickCount64() >= deadline_ ? L"Timed out" : timeoutErr;
             Sleep(stepMs);
         }
     }
 
+    // Hand the focus back only if Dolby Access took it and the window that had it is still visible.
+    void RestoreForeground() {
+        const HWND cur = GetForegroundWindow();
+        if (!cur || !fg_ || cur == fg_ || !IsWindow(fg_) || !IsWindowVisible(fg_)) return;
+        const bool dolby = (frame_ && (cur == frame_ || GetAncestor(cur, GA_ROOT) == frame_)) || DolbyPidOf(cur) != 0;
+        if (dolby && !SetForegroundWindow(fg_)) Log(L"Dolby mode: could not give the focus back");
+    }
+
+    // A window we launched: remember where it opened, then push it behind and off-screen at once.
+    void ParkLaunched() {
+        GetWindowPlacement(frame_, &wp_);
+        moved_ = SetWindowPos(frame_, HWND_BOTTOM, -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE) != FALSE;
+        RestoreForeground();
+    }
+
     // 1. Reuse the Dolby Access window, or launch the app and wait for its window.
     std::wstring LaunchOrFind() {
-        frame_ = FindDolbyFrame();
+        before_ = DolbyPids();
+        DWORD pid = 0;
+        frame_ = FindDolbyFrame(&pid);
         existed_ = frame_ != nullptr;
         if (!existed_) {
+            if (Cancelled()) return L"Cancelled";
             Log(L"Dolby mode: launching Dolby Access");
             com_ptr<IApplicationActivationManager> aam;
-            DWORD pid = 0;
+            DWORD started = 0;
             HRESULT hr = CoCreateInstance(__uuidof(ApplicationActivationManager), nullptr, CLSCTX_LOCAL_SERVER,
                                           __uuidof(IApplicationActivationManager), aam.put_void());
-            if (SUCCEEDED(hr)) hr = aam->ActivateApplication(kAppId, nullptr, AO_NONE, &pid);
+            if (SUCCEEDED(hr)) hr = aam->ActivateApplication(kAppId, nullptr, AO_NONE, &started); // cannot be cancelled
             if (FAILED(hr)) {
                 Log(L"Dolby mode: ActivateApplication failed 0x%08X", static_cast<unsigned>(hr));
                 return L"Could not start Dolby Access";
             }
             launched_ = true;
-            std::wstring err = Poll(kStepTimeoutMs, 100, [&] { return (frame_ = FindDolbyFrame()) != nullptr; },
-                                    L"Dolby Access did not open a window");
+            ours_ = !before_.count(started);
+            std::wstring err = Poll(kStepTimeoutMs, 50, [&] {
+                if (!(frame_ = FindDolbyFrame(&pid))) return false;
+                ParkLaunched();
+                return true;
+            }, L"Dolby Access did not open a window");
             if (!err.empty()) return err;
         }
-        if (!GetWindowPlacement(frame_, &wp_)) return L"Could not read the Dolby Access window position";
-        Log(L"Dolby mode: window %p (%ls), showCmd %u", static_cast<void*>(frame_), existed_ ? L"reused" : L"launched",
-            wp_.showCmd);
+        if (before_.count(pid)) ours_ = false; // the user's own instance: restore, never close
+        Log(L"Dolby mode: window %p (%ls%ls)", static_cast<void*>(frame_), existed_ ? L"reused" : L"launched",
+            launched_ && !ours_ ? L", process was already running" : L"");
         return {};
     }
 
-    // 2. A minimised UWP app is suspended and has no UI Automation tree: un-minimise without activating, then park
-    //    the window off-screen so it stays alive but out of the way, and give the focus back.
+    // 2. A minimised UWP app is suspended and has no UI Automation tree: un-minimise it straight to an off-screen
+    //    normal position without activating; a normal window is moved off-screen. Both stay alive there.
     std::wstring PrepareWindow() {
-        if (IsIconic(frame_)) ShowWindow(frame_, SW_SHOWNOACTIVATE);
-        moved_ = SetWindowPos(frame_, nullptr, -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) != FALSE;
+        if (launched_) return {}; // parked as soon as it appeared
+        if (!GetWindowPlacement(frame_, &wp_)) return L"Could not read the Dolby Access window position";
+        wasIconic_ = IsIconic(frame_) != FALSE;
+        if (wasIconic_) {
+            WINDOWPLACEMENT off = wp_;
+            OffsetRect(&off.rcNormalPosition, -32000 - off.rcNormalPosition.left, -32000 - off.rcNormalPosition.top);
+            off.flags &= ~static_cast<UINT>(WPF_RESTORETOMAXIMIZED);
+            off.showCmd = SW_SHOWNOACTIVATE;
+            moved_ = SetWindowPlacement(frame_, &off) != FALSE;
+        } else {
+            if (!GetWindowRect(frame_, &rect_)) return L"Could not read the Dolby Access window position";
+            moved_ = SetWindowPos(frame_, nullptr, -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) != FALSE;
+        }
         RestoreForeground();
-        return {};
-    }
-
-    void RestoreForeground() {
-        if (fg_ && IsWindow(fg_) && GetForegroundWindow() != fg_ && !SetForegroundWindow(fg_))
-            Log(L"Dolby mode: could not give the focus back");
+        return moved_ ? std::wstring() : L"Could not move the Dolby Access window";
     }
 
     std::wstring StartUia() {
@@ -520,7 +582,7 @@ private:
             hr = CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER, __uuidof(IUIAutomation),
                                   uia_.put_void());
         if (FAILED(hr)) return L"UI Automation is unavailable";
-        if (auto u2 = uia_.try_as<IUIAutomation2>()) { // keep a hung app from blocking us (and shutdown) for long
+        if (auto u2 = uia_.try_as<IUIAutomation2>()) { // a hung app cannot block us (or shutdown) for long
             u2->put_ConnectionTimeout(2000);
             u2->put_TransactionTimeout(3000);
         }
@@ -541,6 +603,20 @@ private:
         return el;
     }
 
+    // In a pre-existing window: the nav item that is selected now, to put back afterwards.
+    void RememberNav() {
+        com_ptr<IUIAutomationElement> nav = ById(root_.get(), L"NavigationPanel_navigationView");
+        com_ptr<IUIAutomationSelectionPattern> sel;
+        com_ptr<IUIAutomationElementArray> items;
+        com_ptr<IUIAutomationElement> item;
+        int n = 0;
+        if (nav && SUCCEEDED(nav->GetCurrentPatternAs(UIA_SelectionPatternId, __uuidof(IUIAutomationSelectionPattern), sel.put_void())) && sel &&
+            SUCCEEDED(sel->GetCurrentSelection(items.put())) && items && SUCCEEDED(items->get_Length(&n)) && n > 0 &&
+            SUCCEEDED(items->GetElement(0, item.put())) && item)
+            item->GetCurrentPatternAs(UIA_SelectionItemPatternId, __uuidof(IUIAutomationSelectionItemPattern), prevNav_.put_void());
+        if (!prevNav_) Log(L"Dolby mode: could not read the selected nav item");
+    }
+
     // 3. Settings tab (NavigationView item); select it if needed.
     std::wstring SelectSettingsTab() {
         com_ptr<IUIAutomationElement> tab;
@@ -552,7 +628,10 @@ private:
         if (!sel) return L"Dolby Access settings tab cannot be selected";
         BOOL selected = FALSE;
         sel->get_CurrentIsSelected(&selected);
-        if (!selected && FAILED(sel->Select())) return L"Could not open the Dolby Access settings tab";
+        if (!selected) {
+            if (existed_) RememberNav();
+            if (FAILED(sel->Select())) return L"Could not open the Dolby Access settings tab";
+        }
         Log(L"Dolby mode: settings tab %ls", selected ? L"already selected" : L"selected");
         return {};
     }
@@ -575,7 +654,7 @@ private:
             return on;
         };
         std::function<void(IUIAutomationElement*, int)> visit = [&](IUIAutomationElement* parent, int depth) {
-            if (depth > 40 || out.size() >= 2000 || sh_->cancel) return;
+            if (depth > 40 || out.size() >= 2000 || Cancelled()) return;
             com_ptr<IUIAutomationElement> c;
             walker->GetFirstChildElementBuildCache(parent, req.get(), c.put());
             while (c && out.size() < 2000) {
@@ -602,136 +681,120 @@ private:
         return out;
     }
 
-    // Best element for the requested mode in `nodes`, or nullptr. Rank: pattern (SelectionItem > Invoke > Toggle),
-    // then a typical control type, then depth.
+    // The mode control, strictly: Name equal to the mode name (case-insensitive), SelectionItem pattern, and a
+    // ListItem / RadioButton / TabItem. The deepest one wins if several match.
     const Node* Pick(const std::vector<Node>& nodes) const {
-        const wchar_t* want = kModeNames[mode_];
         const Node* best = nullptr;
-        int bestScore = -1;
         for (const Node& n : nodes) {
-            if (!(n.sel || n.inv || n.tog)) continue;
-            if (!EqualNoCase(n.name, want) && !ContainsNoCase(n.id, want)) continue;
-            const bool typical = n.type == UIA_ListItemControlTypeId || n.type == UIA_RadioButtonControlTypeId ||
-                                 n.type == UIA_TabItemControlTypeId || n.type == UIA_ButtonControlTypeId;
-            const int score = (n.sel ? 3 : n.inv ? 2 : 1) * 10000 + (typical ? 1000 : 0) + n.depth;
-            if (score > bestScore) { bestScore = score; best = &n; }
+            const bool type = n.type == UIA_ListItemControlTypeId || n.type == UIA_RadioButtonControlTypeId ||
+                              n.type == UIA_TabItemControlTypeId;
+            if (n.sel && type && EqualNoCase(n.name, kModeNames[mode_]) && (!best || n.depth > best->depth)) best = &n;
         }
         return best;
     }
 
-    void DumpTree(const std::vector<Node>& nodes) const {
-        Log(L"Dolby mode: layout dump (%zu elements):", nodes.size());
+    // Names are replaced by their length: they can contain the signed-in account's name.
+    static void DumpTree(const std::vector<Node>& nodes) {
+        Log(L"Dolby mode: PcSoundSettingsPage dump (%zu elements):", nodes.size());
         size_t lines = 0;
         for (const Node& n : nodes) {
             if (++lines > 80) { Log(L"  ..."); break; }
             const wchar_t* t = TypeName(n.type);
             wchar_t num[16];
             if (!t) { swprintf_s(num, L"%d", n.type); t = num; }
-            Log(L"  %*ls%ls id='%ls' name='%ls'%ls%ls%ls", n.depth * 2, L"", t, n.id.c_str(), n.name.substr(0, 60).c_str(),
+            Log(L"  %*ls%ls id='%ls' nameLen=%zu%ls%ls%ls", n.depth * 2, L"", t, n.id.c_str(), n.name.size(),
                 n.sel ? L" [SelectionItem]" : L"", n.inv ? L" [Invoke]" : L"", n.tog ? L" [Toggle]" : L"");
         }
     }
 
-    // 4 + 5. Fail on the "enable Dolby Atmos" overlay; otherwise discover the mode control (ids unknown).
-    std::wstring FindModeControl(com_ptr<IUIAutomationElement>& target) {
-        bool overlay = false;
+    // 4 + 5. Fail on the "enable Dolby Atmos" overlay; otherwise discover the mode control under PcSoundSettingsPage
+    //        (its ids are unknown).
+    std::wstring FindModeControl(com_ptr<IUIAutomationSelectionItemPattern>& target) {
+        bool overlay = false, page = false;
         std::vector<Node> last;
         std::wstring err = Poll(6000, 250, [&] {
             if (ById(root_.get(), L"SoundOverlay_setupOverlayTitle")) return overlay = true;
-            com_ptr<IUIAutomationElement> page = ById(root_.get(), L"PcSoundSettingsPage");
-            last = Walk(page ? page.get() : root_.get());
-            if (const Node* n = Pick(last)) {
-                target = n->el;
-                Log(L"Dolby mode: control %ls id='%ls' name='%ls'", TypeName(n->type) ? TypeName(n->type) : L"?",
-                    n->id.c_str(), n->name.c_str());
-                return true;
-            }
-            return false;
-        }, L"Dolby Access layout not recognised (app updated?)");
+            com_ptr<IUIAutomationElement> p = ById(root_.get(), L"PcSoundSettingsPage");
+            if (!(page = p != nullptr)) return false;
+            last = Walk(p.get());
+            const Node* n = Pick(last);
+            if (!n) return false;
+            n->el->GetCurrentPatternAs(UIA_SelectionItemPatternId, __uuidof(IUIAutomationSelectionItemPattern), target.put_void());
+            Log(L"Dolby mode: control %ls id='%ls'", TypeName(n->type), n->id.c_str());
+            return target != nullptr;
+        }, kLayoutErr);
         if (overlay) {
             Log(L"Dolby mode: setup overlay shown (Atmos off on the current output)");
             return L"Dolby Atmos is not enabled on the current output";
         }
-        if (err == L"Dolby Access layout not recognised (app updated?)") DumpTree(last);
+        if (err == kLayoutErr) {
+            if (page) DumpTree(last);
+            else Log(L"Dolby mode: PcSoundSettingsPage not found");
+        }
         return err;
     }
 
-    // 6. Select / invoke / toggle, then confirm by a new log line or by the element's own state.
-    std::wstring ActivateAndConfirm(const com_ptr<IUIAutomationElement>& el) {
+    // 6. Select it; success only when Dolby Access logs "Selected profile: <mode>" after this point.
+    std::wstring ActivateAndConfirm(const com_ptr<IUIAutomationSelectionItemPattern>& sel) {
         const auto files = LogFiles();
         const std::wstring logPath = files.empty() ? std::wstring() : files.front();
         ULONGLONG logSize = 0;
         std::wstring ignored;
         if (!logPath.empty()) ReadLogText(logPath, ~0ULL, ignored, &logSize);
-
-        com_ptr<IUIAutomationSelectionItemPattern> sel;
-        com_ptr<IUIAutomationInvokePattern> inv;
-        com_ptr<IUIAutomationTogglePattern> tog;
-        HRESULT hr = E_FAIL;
-        if (SUCCEEDED(el->GetCurrentPatternAs(UIA_SelectionItemPatternId, __uuidof(IUIAutomationSelectionItemPattern), sel.put_void())) && sel) {
-            hr = sel->Select();
-        } else if (SUCCEEDED(el->GetCurrentPatternAs(UIA_InvokePatternId, __uuidof(IUIAutomationInvokePattern), inv.put_void())) && inv) {
-            hr = inv->Invoke();
-        } else if (SUCCEEDED(el->GetCurrentPatternAs(UIA_TogglePatternId, __uuidof(IUIAutomationTogglePattern), tog.put_void())) && tog) {
-            ToggleState ts = ToggleState_Off;
-            tog->get_CurrentToggleState(&ts);
-            hr = ts == ToggleState_On ? S_OK : tog->Toggle();
-        }
+        const HRESULT hr = sel->Select();
         if (FAILED(hr)) {
-            Log(L"Dolby mode: activating the control failed 0x%08X", static_cast<unsigned>(hr));
+            Log(L"Dolby mode: Select failed 0x%08X", static_cast<unsigned>(hr));
             return L"Dolby Access did not accept the change";
         }
-        Log(L"Dolby mode: control activated");
-
+        Log(L"Dolby mode: control selected");
         const std::wstring err = Poll(kConfirmMs, 200, [&] {
             const auto now = LogFiles();
-            if (now.empty()) return false;
-            return LogConfirms(now.front(), now.front() == logPath ? logSize : 0, mode_);
-        }, L"no log line");
-        if (err.empty()) {
-            Log(L"Dolby mode: confirmed by the Dolby Access log");
-            return {};
-        }
-        if (err != L"no log line") return err;
-        BOOL selected = FALSE;
-        ToggleState ts = ToggleState_Off;
-        if ((sel && SUCCEEDED(sel->get_CurrentIsSelected(&selected)) && selected) ||
-            (tog && SUCCEEDED(tog->get_CurrentToggleState(&ts)) && ts == ToggleState_On)) {
-            Log(L"Dolby mode: confirmed by the control state");
-            return {};
-        }
-        return L"Dolby Access did not confirm the change";
+            return !now.empty() && LogConfirms(now.front(), now.front() == logPath ? logSize : 0, mode_);
+        }, L"Dolby Access did not confirm the change");
+        if (err.empty()) Log(L"Dolby mode: confirmed by the Dolby Access log");
+        return err;
     }
 
-    // 7. Put the window back; close the app if we started it.
-    void RestoreWindow() {
-        if (launched_ && !frame_) { // cancelled / timed out before its window appeared: wait briefly so we can close it
-            const ULONGLONG end = GetTickCount64() + 3000;
-            while (!(frame_ = FindDolbyFrame()) && GetTickCount64() < end) Sleep(100);
-            if (frame_) {
+    // 7. Put everything back. Waits here are cleanup: bounded, and they ignore cancel on purpose.
+    void Restore() {
+        if (launched_ && !frame_) { // stopped before its window appeared: wait briefly so we can close it
+            DWORD pid = 0;
+            const ULONGLONG end = GetTickCount64() + kLateWindowMs;
+            while (!(frame_ = FindDolbyFrame(&pid)) && GetTickCount64() < end) Sleep(100);
+            if (frame_ && before_.count(pid)) ours_ = false;
+            if (frame_ && ours_) {
                 PostMessageW(frame_, WM_CLOSE, 0, 0);
                 Log(L"Dolby mode: closed Dolby Access (WM_CLOSE, window appeared late)");
-            } else {
+            } else if (ours_) {
                 Log(L"Dolby mode: Dolby Access window never appeared; it may stay open");
             }
             RestoreForeground();
             return;
         }
-        if (!frame_ || !IsWindow(frame_)) { RestoreForeground(); return; }
-        WINDOWPLACEMENT wp = wp_;
-        if (!existed_) {
-            wp.showCmd = SW_HIDE; // remember the position for next time without flashing the window on screen
+        if (!frame_ || !IsWindow(frame_) || !moved_) return;
+        if (prevNav_ && FAILED(prevNav_->Select())) Log(L"Dolby mode: could not re-select the previous page");
+        if (ours_) {
+            WINDOWPLACEMENT wp = wp_;
+            wp.showCmd = SW_HIDE; // keep its position for next time without flashing it on screen
             com_ptr<IUIAutomationWindowPattern> win;
             if (root_) root_->GetCurrentPatternAs(UIA_WindowPatternId, __uuidof(IUIAutomationWindowPattern), win.put_void());
-            if (moved_) SetWindowPlacement(frame_, &wp);
+            SetWindowPlacement(frame_, &wp);
             const bool closed = win && SUCCEEDED(win->Close());
             if (!closed) PostMessageW(frame_, WM_CLOSE, 0, 0);
             Log(L"Dolby mode: closed Dolby Access (%ls)", closed ? L"WindowPattern" : L"WM_CLOSE");
-        } else {
-            wp.showCmd = wp_.showCmd == SW_SHOWMINIMIZED ? SW_SHOWMINNOACTIVE
-                       : wp_.showCmd == SW_SHOWMAXIMIZED ? SW_SHOWMAXIMIZED : SW_SHOWNOACTIVATE;
+        } else if (launched_) { // an already running process we brought up: leave the window where it opened
+            WINDOWPLACEMENT wp = wp_;
+            wp.showCmd = SW_SHOWNOACTIVATE;
             SetWindowPlacement(frame_, &wp);
-            Log(L"Dolby mode: window restored");
+            Log(L"Dolby mode: window left open at its own position");
+        } else if (wasIconic_) {
+            WINDOWPLACEMENT wp = wp_;
+            wp.showCmd = SW_SHOWMINNOACTIVE;
+            SetWindowPlacement(frame_, &wp);
+            Log(L"Dolby mode: window minimised again");
+        } else {
+            SetWindowPos(frame_, nullptr, rect_.left, rect_.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            Log(L"Dolby mode: window moved back");
         }
         RestoreForeground();
     }
@@ -743,7 +806,8 @@ void RunMode(std::shared_ptr<Shared> sh, int mode) {
     {
         ComInit com;
         try {
-            err = ModeJob(sh, mode).Run();
+            ModeJob job(sh, mode); // restores in its destructor, still inside the COM apartment
+            err = job.Run();
         } catch (const winrt::hresult_error& e) {
             Log(L"Dolby mode: failed 0x%08X", static_cast<unsigned>(e.code().value));
             err = L"Dolby Access automation failed";
@@ -759,7 +823,7 @@ void RunMode(std::shared_ptr<Shared> sh, int mode) {
         s.modeBusy = false;
         s.modeError = err;
         s.mode = err.empty() ? mode : now;
-        s.modeAt = GetTickCount64();
+        s.modeAt = s.mode >= 0 ? GetTickCount64() : 0;
     });
 }
 
@@ -784,6 +848,7 @@ struct Dolby::Impl {
             std::lock_guard<std::mutex> lk(sh->m);
             if (sh->running) return false;
             sh->running = true;
+            sh->jobCancel = false;
             mark(*sh);
         }
         try {
@@ -811,7 +876,7 @@ Dolby::~Dolby() {
         }
         if (impl_->worker.joinable()) {
             if (done) impl_->worker.join();
-            else { // it only touches Shared, which it co-owns
+            else { // stuck in a call it cannot cancel; it only touches Shared, which it co-owns
                 Log(L"Dolby: worker did not stop in time; detaching");
                 impl_->worker.detach();
             }
@@ -859,28 +924,28 @@ DolbyState Dolby::Get(const std::wstring& endpointId) const {
         const BaseState& b = it->second;
         DolbyState s = b.s;
 
-        bool running, toggleBusy, denied, refreshMode;
+        bool toggleBusy, denied, refreshMode;
         std::wstring toggleNote;
         {
             std::lock_guard<std::mutex> lk(im.sh->m);
-            running = im.sh->running;
             toggleBusy = im.sh->toggleBusy;
-            denied = im.sh->denied;
-            toggleNote = im.sh->toggleNote;
+            denied = im.sh->denied.count(endpointId) != 0;
+            if (im.sh->toggleEndpoint == endpointId) toggleNote = im.sh->toggleNote;
             s.modeBusy = im.sh->modeBusy;
             s.modeError = im.sh->modeError;
             refreshMode = im.automation && !im.sh->modeBusy && (im.sh->modeAt == 0 || now - im.sh->modeAt >= kModeCacheMs);
             s.mode = im.sh->mode;
         }
-        if (refreshMode && s.appInstalled) { // file read only, no UI
+        if (refreshMode && s.appInstalled) { // file read only, no UI; a failed read is retried on the next call
             s.mode = ReadCurrentMode();
             std::lock_guard<std::mutex> lk(im.sh->m);
             im.sh->mode = s.mode;
-            im.sh->modeAt = now;
+            im.sh->modeAt = s.mode >= 0 ? now : 0;
         }
 
-        s.canToggle = s.appInstalled && s.statusKnown && b.supported && !denied && !running;
-        s.canSetMode = im.automation && s.appInstalled && b.atmosActive && !running;
+        // Stable while a job runs: progress is reported through modeBusy and the note, not by hiding controls.
+        s.canToggle = s.appInstalled && s.statusKnown && b.supported && !denied;
+        s.canSetMode = im.automation && s.appInstalled && b.atmosActive;
         if (im.automation && s.appInstalled) {
             for (int i = 0; i < kModeCount; ++i) s.modes.push_back({i, kModeNames[i]});
         } else {
@@ -892,8 +957,6 @@ DolbyState Dolby::Get(const std::wstring& endpointId) const {
         if (!s.note.empty()) note += s.note + L" ";
         if (toggleBusy) note += L"Switching spatial sound… ";
         else if (!toggleNote.empty()) note += toggleNote + L" ";
-        if (denied && toggleNote.empty())
-            note += L"Windows did not allow XMTray to switch spatial sound; use Dolby Access or Windows sound settings. ";
         if (!im.automation)
             note += L"Sound modes (Dynamic, Movie, Music, Game, Voice) can only be changed in Dolby Access: Windows and "
                     L"Dolby provide no interface for other apps. An experimental option on this page can switch them by "
@@ -922,8 +985,14 @@ bool Dolby::SetEnabled(const std::wstring& endpointId, bool atmosOn) {
 }
 
 void Dolby::SetAutomation(bool enabled) {
-    impl_->automation = enabled;
-    impl_->cache.clear();
+    try {
+        impl_->automation = enabled;
+        if (!enabled) {
+            std::lock_guard<std::mutex> lk(impl_->sh->m);
+            if (impl_->sh->modeBusy) impl_->sh->jobCancel = true; // the job restores the window and reports "Cancelled"
+        }
+        impl_->cache.clear();
+    } catch (...) {}
 }
 
 bool Dolby::SetMode(int mode) {

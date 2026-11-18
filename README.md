@@ -17,16 +17,25 @@ Unofficial desktop control for Sony Bluetooth headphones on Windows 10/11: noise
 - Codec reported by the headphones (SBC / AAC / LDAC / aptX) and the Windows output format
 - Several headphones: pick one; optionally route Windows audio to it and follow the Windows output device
 - Multipoint: connected sources and playback switching (protocol v2 models)
-- Spatial sound status (Off / Windows Sonic / Dolby Atmos for Headphones) and a shortcut to Dolby Access
+- Per-model controls: button / touch assignment, NC/AMB button cycle, adaptive ambient, listening modes, voice guidance, voice assistant, head gestures, automatic source switching, pairing mode, safe-listening level, playback control and track info
+- Spatial sound status (Off / Windows Sonic / Dolby Atmos for Headphones), an on/off attempt, and a shortcut to Dolby Access
+- Experimental, opt-in: switch Dolby Access sound modes (see "Dolby")
 - Notifications on connect, disconnect and low battery
 - Connects on demand; the control link is dropped shortly after the window is hidden
 
-Supported models are whatever [libmdr](https://github.com/mos9527/SonyHeadphonesClient) supports (WH-1000XM3…XM6, WF-1000XM4…XM6 and relatives); features vary by model and firmware.
+Supported models are whatever [libmdr](https://github.com/mos9527/SonyHeadphonesClient) supports; features vary by model and firmware. See [docs/SUPPORT.md](docs/SUPPORT.md) for the per-model matrix (the original MDR-1000X has no evidence of working).
 
-### Limits
+![Controls](docs/ui-controls.png)
 
-- LDAC / aptX on Windows need a third-party A2DP driver. XMTray only reports the codec.
-- Dolby Access sound modes have no public interface. See "Dolby" below.
+### LDAC
+
+An app cannot add a Bluetooth codec to Windows. LDAC needs a third-party kernel A2DP driver; XMTray ships none. What XMTray does: show the codec the headphones report and let you set the headphones' connection priority to sound quality. Details and a checklist: [docs/LDAC.md](docs/LDAC.md).
+
+### Dolby
+
+Windows exposes the active spatial sound format, which XMTray shows. Turning Dolby Atmos on or off is attempted through the documented API, which Windows may refuse for apps other than Dolby Access.
+
+Dolby Access sound modes (Dynamic / Movie / Music / Game / Voice / Personalize) have no public interface. The experimental option (off by default) drives the Dolby Access window through UI Automation: it opens the app or uses its open window, moves it out of view, selects the mode by its exact name, confirms the change from Dolby's own log file, and puts the window back. It runs only while the selected headphones are the Windows default output with Dolby Atmos on. **The selection step has never been run end to end** (it needs Atmos enabled on an output); it will break when Dolby changes its app, and it fails closed when it does not recognise the layout.
 
 ## Build
 

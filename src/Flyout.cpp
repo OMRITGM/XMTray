@@ -104,6 +104,7 @@ struct Item {
     int mn = 0, mx = 0, step = 1, val = 0;
     std::function<void()> click;
     std::function<void(int, bool)> change; // (value, final)
+    size_t key = 0; // what the item addresses; a mouse release fires only if it still matches the press
 };
 
 struct Col {
@@ -216,6 +217,7 @@ struct Flyout::Impl {
     size_t modalStart = 0;
 
     int hoverId = 0, pressId = 0, focusId = 0;
+    size_t pressKey = 0;
     bool focusVisible = false, tracking = false;
     int dragId = 0, dragVal = 0, lastSent = 0;
     Item drag;
@@ -231,6 +233,7 @@ struct Flyout::Impl {
     D2D1_RECT_F ddAnchor{};
     // open list picker (Choice with many options): refreshed by the field on every paint, closed if it disappears
     int pickId = 0, pickVal = 0;
+    size_t pickRowKey = 0;
     bool pickSeen = false;
     D2D1_RECT_F pickAnchor{};
     std::vector<NamedInt> pickOpts;
@@ -905,8 +908,9 @@ struct Flyout::Impl {
     }
 
     // One Choice picker: <= 4 short options -> segmented, <= 8 -> wrapping chips, more -> a list field with a popup.
+    // rowKey identifies what the row addresses (assignable key, general item); each option item's key adds its value
     float Picker(int idBase, float x, float y, float w, const std::vector<NamedInt>& opts, int value,
-                 std::function<void(int)> send) {
+                 std::function<void(int)> send, size_t rowKey = 0) {
         if (opts.empty()) return y;
         std::vector<std::wstring> labels;
         std::vector<int> values;
@@ -917,13 +921,18 @@ struct Flyout::Impl {
             values.push_back(o.value);
         }
         auto pick = [send, values](int i) { send(values[size_t(i)]); };
+        size_t n0 = items.size();
+        auto tag = [&](float end) { // Segmented / Chips add one item per option, in order
+            for (size_t i = n0, k = 0; i < items.size() && k < values.size(); ++i, ++k) items[i].key = KeyOf(rowKey, values[k]);
+            return end;
+        };
         if (opts.size() <= 4) {
             float sw = (w - 6.f) / F(opts.size());
             bool fit = true;
             for (auto& l : labels) fit = fit && Measure(l, 13.f, Semi).width + 18.f <= sw;
-            if (fit) return Segmented(idBase, x, y, w, 36.f, labels, sel, pick);
+            if (fit) return tag(Segmented(idBase, x, y, w, 36.f, labels, sel, pick));
         }
-        if (opts.size() <= 8) return Chips(idBase, x, y, w, labels, sel, pick);
+        if (opts.size() <= 8) return tag(Chips(idBase, x, y, w, labels, sel, pick));
         bool open = pickId == idBase;
         D2D1_RECT_F r{x, y, x + std::min(w, 320.f), y + 38.f};
         Fill(r, open ? pal.hover : StateBg(idBase, pal.btn), 8.f);
@@ -931,7 +940,9 @@ struct Flyout::Impl {
         Text(sel >= 0 ? labels[size_t(sel)] : L"Choose…", {r.left + 14.f, y, r.right - 36.f, r.bottom}, 13.5f,
              sel >= 0 ? pal.text : pal.text3, sel >= 0 ? Semi : Reg);
         Icon(GChevron, r.right - 19.f, y + 19.f, 16.f, pal.text2);
-        Add(idBase, r).click = [this, idBase] { pickId = pickId == idBase ? 0 : idBase; };
+        Item& field = Add(idBase, r);
+        field.click = [this, idBase] { pickId = pickId == idBase ? 0 : idBase; };
+        field.key = rowKey;
         FocusRing(idBase, r, 8.f);
         if (open && !dry) {
             pickSeen = true;
@@ -939,13 +950,17 @@ struct Flyout::Impl {
             pickOpts = opts;
             pickVal = value;
             pickSend = send;
+            pickRowKey = rowKey;
         }
         return r.bottom;
     }
 
+    static size_t KeyOf(size_t row, int v) { return row * 1000003u ^ (std::hash<int>{}(v) + 0x9E3779B9u); }
+    static size_t KeyOf(const std::wstring& label, int pos) { return KeyOf(std::hash<std::wstring>{}(label), pos); }
+
     // label (+ hint) over a picker, spaced like the auto power-off row
     float ChoiceRow(int idBase, float x, float y, float w, const std::wstring& label, const std::wstring& hint,
-                    const std::vector<NamedInt>& opts, int value, std::function<void(int)> send) {
+                    const std::vector<NamedInt>& opts, int value, std::function<void(int)> send, size_t rowKey = 0) {
         y += 14.f;
         Text(label, {x, y, x + w, y + 22.f}, 14.f, pal.text);
         y += 22.f;
@@ -954,7 +969,7 @@ struct Flyout::Impl {
             Text(hint, {x, y + 1.f, x + w, y + 3.f + hh}, 12.5f, pal.text3, Reg, AlLeft, true);
             y += hh + 1.f;
         }
-        y = Picker(idBase, x, y + 10.f, w, opts, value, std::move(send));
+        y = Picker(idBase, x, y + 10.f, w, opts, value, std::move(send), rowKey);
         return y + 16.f;
     }
 
@@ -1174,12 +1189,14 @@ struct Flyout::Impl {
             Text(pickOpts[i].label, {r.left + 12.f, r.top, r.right - 34.f, r.bottom}, 13.5f, pal.text, cur ? Semi : Reg);
             if (cur) Icon(GCheck, r.right - 18.f, ry + ih / 2.f, 16.f, pal.accentText);
             int v = pickOpts[i].value, field = pickId;
-            Add(id, r).click = [this, v, field] {
+            Item& it = Add(id, r);
+            it.click = [this, v, field] {
                 auto fn = pickSend;
                 pickId = 0;
                 focusId = field;
                 if (fn) fn(v);
             };
+            it.key = KeyOf(pickRowKey, v);
             FocusRing(id, r, 8.f);
         }
     }
@@ -2006,7 +2023,8 @@ struct Flyout::Impl {
             if (k) Divider(x, y, w);
             int pos = static_cast<int>(k);
             y = ChoiceRow(ID_ASSIGN + pos * 50, x, y, w, key.label.empty() ? L"Button " + std::to_wstring(k + 1) : key.label, {},
-                          key.options, key.action, [this, pos](int v) { Feat(Feature::Assignable, v, pos); });
+                          key.options, key.action, [this, pos](int v) { Feat(Feature::Assignable, v, pos); },
+                          KeyOf(key.label, pos)); // label + position: release must address the key that was pressed
         }
         if (Usable(s.ncButton)) {
             if (!s.assignable.empty()) Divider(x, y, w);
@@ -2096,12 +2114,15 @@ struct Flyout::Impl {
             const GeneralItem& g = s.general[k];
             int id = ID_GEN + static_cast<int>(k) * 50, idx = g.index;
             sep();
+            size_t rowKey = KeyOf(L"general", idx); // release must hit the same item.index that was pressed
             if (g.isBool) {
+                size_t n0 = items.size();
                 y = ToggleRow(id, x, y, w, g.label, {}, g.on, [this, idx](bool on) { Feat(Feature::General, on ? 1 : 0, idx); },
                               g.writable);
+                for (size_t i = n0; i < items.size(); ++i) items[i].key = rowKey;
             } else if (g.writable) {
                 y = ChoiceRow(id, x, y, w, g.label, {}, g.options, GeneralValue(g),
-                              [this, idx](int v) { Feat(Feature::General, v, idx); });
+                              [this, idx](int v) { Feat(Feature::General, v, idx); }, rowKey);
             } else {
                 std::wstring cur;
                 int v = GeneralValue(g);
@@ -2262,8 +2283,10 @@ struct Flyout::Impl {
                              host.Config().dolbyAutomation = on;
                              host.ConfigChanged();
                          });
-            const std::wstring hint = L"Experimental. Opens Dolby Access off-screen for a few seconds and selects the mode there. "
-                                      L"May break when Dolby updates its app.";
+            const std::wstring hint =
+                L"Experimental. Briefly opens Dolby Access (or uses its open window), moves it out of view, selects the mode "
+                L"there and puts it back. Works only while these headphones are the Windows output with Dolby Atmos on. "
+                L"May break when Dolby updates its app.";
             float hh = TextH(hint, 12.5f, w - 34.f);
             Text(hint, {x + 34.f, y - 4.f, x + w, y - 2.f + hh}, 12.5f, pal.text3, Reg, AlLeft, true);
             y += hh;
@@ -2332,7 +2355,8 @@ struct Flyout::Impl {
 
     float PageDolby(const Col& c, float y) {
         y = Card(c.x, y, c.w, B(&Impl::DolbyStatusBody));
-        if (dolby.canSetMode && !dolby.modes.empty()) y = Card(c.x, y + GAP, c.w, B(&Impl::DolbyModeBody));
+        // keep the card while a switch runs or failed, so the spinner / inert tiles / error stay visible
+        if ((dolby.canSetMode && !dolby.modes.empty()) || dolby.modeBusy || !dolby.modeError.empty()) y = Card(c.x, y + GAP, c.w, B(&Impl::DolbyModeBody));
         return y;
     }
 
@@ -2522,7 +2546,7 @@ struct Flyout::Impl {
 
         bool anim = shown && !IsIconic(hwnd) &&
                     ((stateView && (snap.link == Link::Connecting || snap.link == Link::Initializing)) ||
-                     (!stateView && page == 3 && dolby.canSetMode && !dolby.modes.empty() && dolby.modeBusy));
+                     (!stateView && page == 3 && dolby.modeBusy));
         if (anim != animOn) {
             animOn = anim;
             if (anim) SetTimer(hwnd, TIMER_ANIM, 33, nullptr);
@@ -2837,6 +2861,7 @@ struct Flyout::Impl {
                     MaybeSend();
                 } else {
                     pressId = it->id;
+                    pressKey = it->key;
                 }
             }
             Invalidate();
@@ -2849,7 +2874,7 @@ struct Flyout::Impl {
                 Item* it = Hit(Dip(l));
                 int pressed = pressId;
                 pressId = 0;
-                if (it && it->id == pressed && !it->text) Activate(*it);
+                if (it && it->id == pressed && it->key == pressKey && !it->text) Activate(*it);
             }
             ReleaseCapture();
             Invalidate();

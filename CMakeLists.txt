@@ -21,6 +21,6 @@ target_link_libraries(XMTray PRIVATE mdr mdr-bt
     d2d1 dwrite dwmapi shcore windowsapp shell32 ole32 uuid user32 gdi32 advapi32 setupapi cfgmgr32)
 # Portable exe: resolve imported DLLs from System32 only (no planted DLL next to the exe).
 target_link_options(XMTray PRIVATE /DEPENDENTLOADFLAG:0x800
-    # Not KnownDLLs: bind them lazily, after wWinMain has restricted the DLL search path to System32.
-    /DELAYLOAD:d2d1.dll /DELAYLOAD:dwrite.dll /DELAYLOAD:dwmapi.dll /DELAYLOAD:setupapi.dll /DELAYLOAD:cfgmgr32.dll)
+    # Bind the non-KnownDLLs lazily, after wWinMain has restricted the DLL search path to System32.
+    /DELAYLOAD:d2d1.dll /DELAYLOAD:dwrite.dll /DELAYLOAD:dwmapi.dll /DELAYLOAD:cfgmgr32.dll /DELAYLOAD:bthprops.cpl)
 target_link_libraries(XMTray PRIVATE delayimp)

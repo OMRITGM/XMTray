@@ -131,6 +131,10 @@ const wchar_t* PresetFallbackName(MDREqualizerPreset id)
 }
 
 constexpr auto kPressurePeriod = std::chrono::seconds(1);
+// Sound pressure and (on some models) track changes are only reported when asked for.
+constexpr auto kLivePeriod = std::chrono::seconds(5);
+// An ACK confirms delivery of a playback command, not the new state: look again a little later.
+constexpr auto kPlaybackRecheck = std::chrono::milliseconds(600);
 
 NamedInt Opt(uint32_t value, std::wstring label) { return {static_cast<int>(value), std::move(label)}; }
 
@@ -283,8 +287,34 @@ struct DeviceWorker::Impl {
     int shownPressure = -1;
     Clock::time_point pressureAt{};
     bool pressureLate = false; // a newer value is being held back
+    Clock::time_point lastLive{};        // last periodic sound-pressure / playback sync
+    Clock::time_point playbackRecheck{}; // when to sync playback again after a command; {} = not scheduled
+    // Last timed auto-power-off seen outside "when removed" mode (libmdr reads 0 minutes while in it); 0 = none.
+    uint32_t lastTimedMinutes = 0;
+    mutable bool assignWarned = false, ncButtonWarned = false; // log once per link
 
     // ---- small libmdr helpers ----
+    std::vector<MDRAssignableAction> AssignableActions(MDRAssignableActionKeyLocation key) const
+    {
+        return List<MDRAssignableAction>([this, key](MDRAssignableAction* o, uint32_t* c)
+                                         { return mdrHeadphonesGetAssignableControlActions(hp, key, o, c); });
+    }
+    bool AssignableOffers(const MDRAssignableControl& ctl, MDRAssignableAction action) const
+    {
+        const auto actions = AssignableActions(ctl.location);
+        return action < MDR_ASSIGNABLE_UNKNOWN && std::find(actions.begin(), actions.end(), action) != actions.end();
+    }
+    // libmdr validates the whole key array on every write: one key it cannot write back blocks all of them.
+    // Returns the position of the first such key, or -1.
+    int BadAssignKey(const std::vector<MDRAssignableControl>& controls) const
+    {
+        for (size_t i = 0; i < controls.size(); ++i)
+            if (controls[i].location == MDR_ASSIGNABLE_ACTION_KEY_UNKNOWN ||
+                controls[i].type == MDR_ASSIGNABLE_ACTION_KEY_TYPE_UNKNOWN ||
+                !AssignableOffers(controls[i], controls[i].action))
+                return static_cast<int>(i);
+        return -1;
+    }
     std::vector<MDRGeneralSettingInfo> GeneralInfos() const
     {
         return List<MDRGeneralSettingInfo>(
@@ -366,6 +396,9 @@ struct DeviceWorker::Impl {
         alertText.clear();
         shownPressure = -1;
         pressureLate = false;
+        playbackRecheck = {};
+        lastTimedMinutes = 0;
+        assignWarned = ncButtonWarned = false;
         dirty = true;
     }
     void Fail(const std::wstring& why)
@@ -530,7 +563,9 @@ struct DeviceWorker::Impl {
             }
             else
             {
-                if (c.b < 0 || c.b > static_cast<int>(MDR_NOISE_BUTTON_AMBIENT_OFF))
+                // NONE also stands for a device value libmdr cannot map, so it is neither offered nor overwritten.
+                if (n.button_mode == MDR_NOISE_BUTTON_NONE || c.b <= static_cast<int>(MDR_NOISE_BUTTON_NONE) ||
+                    c.b > static_cast<int>(MDR_NOISE_BUTTON_AMBIENT_OFF))
                     return Ignored(c);
                 n.button_mode = static_cast<MDRNoiseButtonMode>(c.b);
             }
@@ -601,9 +636,10 @@ struct DeviceWorker::Impl {
                 if (p.wearing_power == MDR_WEARING_POWER_UNAVAILABLE)
                     return Ignored(c);
                 p.wearing_power = on ? MDR_WEARING_POWER_WHEN_REMOVED : MDR_WEARING_POWER_DISABLED;
-                // Leaving the mode falls back to a timed option; libmdr refuses minutes the device does not offer.
+                // Leaving the mode goes back to the timer used before it (GetPower reads 0 minutes while in it),
+                // else to what libmdr reports; libmdr refuses minutes the device does not offer.
                 int count = 0, first = -1;
-                bool offered = false;
+                bool offered = false, lastOffered = false;
                 Value(MDR_VALUE_AUTO_POWER_OFF_OPTION_COUNT, 0, count);
                 for (int i = 0; i < count; ++i)
                 {
@@ -613,8 +649,11 @@ struct DeviceWorker::Impl {
                     if (first < 0)
                         first = minutes;
                     offered = offered || minutes == static_cast<int>(p.auto_power_off_minutes);
+                    lastOffered = lastOffered || (minutes > 0 && minutes == static_cast<int>(lastTimedMinutes));
                 }
-                if (!on && !offered && first >= 0)
+                if (!on && lastOffered)
+                    p.auto_power_off_minutes = lastTimedMinutes;
+                else if (!on && !offered && first >= 0)
                     p.auto_power_off_minutes = static_cast<uint32_t>(first);
             }
             Check(L"Power", mdrHeadphonesSetPower(hp, &p));
@@ -652,6 +691,19 @@ struct DeviceWorker::Impl {
             auto controls = AssignableControls();
             if (c.c < 0 || static_cast<size_t>(c.c) >= controls.size() || c.b < 0)
                 return Ignored(c);
+            if (const int bad = BadAssignKey(controls); bad >= 0)
+            {
+                Log(L"Assignable ignored: key %d (%ls) holds action %u that cannot be written back; set it in the Sony app",
+                    bad, AssignableKeyName(controls[static_cast<size_t>(bad)]).c_str(),
+                    controls[static_cast<size_t>(bad)].action);
+                break;
+            }
+            if (!AssignableOffers(controls[static_cast<size_t>(c.c)], static_cast<MDRAssignableAction>(c.b)))
+            {
+                Log(L"Assignable ignored: key %d (%ls) does not offer action %d", c.c,
+                    AssignableKeyName(controls[static_cast<size_t>(c.c)]).c_str(), c.b);
+                break;
+            }
             controls[static_cast<size_t>(c.c)].action = static_cast<MDRAssignableAction>(c.b);
             Check(L"AssignableControls",
                   mdrHeadphonesSetAssignableControls(hp, controls.data(), static_cast<uint32_t>(controls.size())));
@@ -680,6 +732,7 @@ struct DeviceWorker::Impl {
             Check(L"Playback", mdrHeadphonesSendPlaybackCommand(hp, &pc));
             // Some models (WH-1000XM5) do not notify playback changes; Flush() commits first, then syncs.
             pendingSync |= MDR_HEADPHONES_SYNC_PLAYBACK;
+            playbackRecheck = Clock::now() + kPlaybackRecheck;
             break;
         }
         case Command::SetNc:
@@ -1004,7 +1057,10 @@ struct DeviceWorker::Impl {
         if (havePower && Has(MDR_FEATURE_AUTO_POWER_OFF))
         {
             s.hasAutoPowerOff = true;
-            s.autoPowerOffMinutes = static_cast<int>(power.auto_power_off_minutes);
+            // "When removed" replaces the timer (libmdr reads 0 minutes then): no timed option is selected.
+            s.autoPowerOffMinutes = power.wearing_power == MDR_WEARING_POWER_WHEN_REMOVED
+                                        ? -1
+                                        : static_cast<int>(power.auto_power_off_minutes);
             int count = 0;
             Value(MDR_VALUE_AUTO_POWER_OFF_OPTION_COUNT, 0, count);
             for (int i = 0; i < count; ++i)
@@ -1064,15 +1120,22 @@ struct DeviceWorker::Impl {
                                          {Opt(MDR_ADAPTIVE_SENSITIVITY_LOW, L"Low"),
                                           Opt(MDR_ADAPTIVE_SENSITIVITY_STANDARD, L"Standard"),
                                           Opt(MDR_ADAPTIVE_SENSITIVITY_HIGH, L"High")}};
+                EnsureOption(s.adaptiveSensitivity.options, s.adaptiveSensitivity.value, L"Not set");
             }
-            if (Has(MDR_FEATURE_NOISE_CONTROL_BUTTON))
+            // NONE is also what libmdr reads for a device value it cannot map, and every noise-control write
+            // sends the button function back: never offer it, and leave such a device alone.
+            if (Has(MDR_FEATURE_NOISE_CONTROL_BUTTON) && n.button_mode != MDR_NOISE_BUTTON_NONE)
                 s.ncButton = {true,
                               static_cast<int>(n.button_mode),
                               {Opt(MDR_NOISE_BUTTON_NOISE_AMBIENT_OFF, L"Noise cancelling / Ambient / Off"),
                                Opt(MDR_NOISE_BUTTON_NOISE_AMBIENT, L"Noise cancelling / Ambient"),
                                Opt(MDR_NOISE_BUTTON_NOISE_OFF, L"Noise cancelling / Off"),
-                               Opt(MDR_NOISE_BUTTON_AMBIENT_OFF, L"Ambient / Off"),
-                               Opt(MDR_NOISE_BUTTON_NONE, L"No function")}};
+                               Opt(MDR_NOISE_BUTTON_AMBIENT_OFF, L"Ambient / Off")}};
+            else if (Has(MDR_FEATURE_NOISE_CONTROL_BUTTON) && !ncButtonWarned)
+            {
+                ncButtonWarned = true;
+                Log(L"NC/AMB button function reads as none/unmapped; not offering it");
+            }
         }
 
         MDRListening l{};
@@ -1103,10 +1166,13 @@ struct DeviceWorker::Impl {
                     s.listeningMode.options.push_back(Opt(lm.mode, lm.label));
             }
             if (Has(MDR_FEATURE_LISTENING_BACKGROUND_MUSIC))
+            {
                 s.bgmRoom = {true,
                              static_cast<int>(l.background_room),
                              {Opt(MDR_ROOM_SMALL, L"My room (small)"), Opt(MDR_ROOM_MEDIUM, L"Living room (medium)"),
                               Opt(MDR_ROOM_LARGE, L"Cafe (large)")}};
+                EnsureOption(s.bgmRoom.options, s.bgmRoom.value, L"Not set");
+            }
         }
 
         MDRVoiceGuidance vg{};
@@ -1218,19 +1284,31 @@ struct DeviceWorker::Impl {
         }
 
         if (Has(MDR_FEATURE_ASSIGNABLE_CONTROLS))
-            for (const MDRAssignableControl& ctl : AssignableControls()) // one entry per key: Command index = position
+        {
+            const auto controls = AssignableControls();
+            // One key libmdr cannot write back blocks every write: show all keys read-only (current action only).
+            const int bad = BadAssignKey(controls);
+            if (bad >= 0 && !assignWarned)
+            {
+                assignWarned = true;
+                Log(L"Assignable keys are read-only: key %d (%ls) holds action %u that cannot be written back", bad,
+                    AssignableKeyName(controls[static_cast<size_t>(bad)]).c_str(),
+                    controls[static_cast<size_t>(bad)].action);
+            }
+            for (const MDRAssignableControl& ctl : controls) // one entry per key: Command index = position
             {
                 AssignKey key;
                 key.label = AssignableKeyName(ctl);
                 key.action = static_cast<int>(ctl.action);
-                for (const MDRAssignableAction a :
-                     List<MDRAssignableAction>([this, &ctl](MDRAssignableAction* o, uint32_t* c)
-                                               { return mdrHeadphonesGetAssignableControlActions(hp, ctl.location, o, c); }))
-                    if (a < MDR_ASSIGNABLE_UNKNOWN)
+                for (const MDRAssignableAction a : AssignableActions(ctl.location))
+                    if (bad < 0 && a < MDR_ASSIGNABLE_UNKNOWN)
                         EnsureOption(key.options, static_cast<int>(a), AssignableActionName(a));
-                EnsureOption(key.options, key.action, AssignableActionName(ctl.action));
+                EnsureOption(key.options, key.action,
+                             ctl.action < MDR_ASSIGNABLE_UNKNOWN ? AssignableActionName(ctl.action)
+                                                                 : L"Unknown (set in Sony app)");
                 s.assignable.push_back(std::move(key));
             }
+        }
     }
 
     void Publish()
@@ -1243,6 +1321,10 @@ struct DeviceWorker::Impl {
         if (hp)
         {
             s.protocol = service == 0 ? 2 : 1;
+            MDRPower power{};
+            if (mdrHeadphonesGetPower(hp, MDR_PROPERTY_DESIRED, &power) == MDR_RESULT_OK &&
+                power.wearing_power != MDR_WEARING_POWER_WHEN_REMOVED && power.auto_power_off_minutes != 0)
+                lastTimedMinutes = power.auto_power_off_minutes;
             FillDevice(s);
             if (s.hasSafeListening)
             {
@@ -1356,6 +1438,22 @@ struct DeviceWorker::Impl {
                 {
                     lastBattery = now;
                     pendingSync |= MDR_HEADPHONES_SYNC_BATTERY;
+                }
+                // These only set pending flags: Flush() still commits first and never overlaps a request.
+                const bool playback = Has(MDR_FEATURE_PLAYBACK_CONTROL) || Has(MDR_FEATURE_PLAYBACK_METADATA);
+                if (now - lastLive >= kLivePeriod)
+                {
+                    lastLive = now;
+                    if (Has(MDR_FEATURE_SAFE_LISTENING))
+                        pendingSync |= MDR_HEADPHONES_SYNC_SAFE_LISTENING;
+                    if (playback)
+                        pendingSync |= MDR_HEADPHONES_SYNC_PLAYBACK;
+                }
+                if (playbackRecheck != Clock::time_point{} && now >= playbackRecheck)
+                {
+                    playbackRecheck = {};
+                    if (playback)
+                        pendingSync |= MDR_HEADPHONES_SYNC_PLAYBACK;
                 }
             }
             Flush();
