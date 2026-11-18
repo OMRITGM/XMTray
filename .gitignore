@@ -1,0 +1,6 @@
+/b/
+/b-configure.log
+/dist/
+*.zip
+/ui-*.png
+*.exe

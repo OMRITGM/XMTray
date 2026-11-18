@@ -1,0 +1,38 @@
+diff --git a/libmdr-bt/src/Windows/ConnectionWindows.cpp b/libmdr-bt/src/Windows/ConnectionWindows.cpp
+index c17b59d..9a75fc6 100644
+--- a/libmdr-bt/src/Windows/ConnectionWindows.cpp
++++ b/libmdr-bt/src/Windows/ConnectionWindows.cpp
+@@ -294,12 +294,16 @@ struct MDRConnectionWindows
+                 if (err == ERROR_NO_MORE_ITEMS)
+                 {
+                     MDR_LOG("No devices found on radio #{}", radioIndex);
+-                    break;
++                    ::CloseHandle(radio);
++                    radioIndex++;
++                    continue;
+                 }
+                 else
+                 {
+                     ptr->lastError = FormatErrorString(err);
+                     MDR_LOG("Device search error: {}", ptr->lastError);
++                    ::CloseHandle(radio);
++                    BluetoothFindRadioClose(radioFindHandle);
+                     return MDR_RESULT_ERROR_NET;
+                 }
+             }
+@@ -318,9 +322,13 @@ struct MDRConnectionWindows
+                 CopyUtf8(back.szDeviceMacAddress, szMacAddress.c_str());
+             }
+             while (BluetoothFindNextDevice(deviceFindHandle, &deviceInfo));
+-            if (!BluetoothFindDeviceClose(deviceFindHandle))
++            const BOOL deviceFindClosed = BluetoothFindDeviceClose(deviceFindHandle);
++            const DWORD deviceFindCloseError = ::GetLastError();
++            ::CloseHandle(radio);
++            if (!deviceFindClosed)
+             {
+-                ptr->lastError = FormatErrorString(::GetLastError());
++                ptr->lastError = FormatErrorString(deviceFindCloseError);
++                BluetoothFindRadioClose(radioFindHandle);
+                 return MDR_RESULT_ERROR_NET;
+             }
+             radioIndex++;
