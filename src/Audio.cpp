@@ -87,7 +87,18 @@ std::string MacFromInstanceId(std::wstring id) {
 struct BtNode {
     GUID container;
     std::string mac;
+    std::wstring a2dpProvider; // driver provider of this node if it is the A2DP sink service (UUID 110B)
 };
+
+std::wstring DevString(DEVINST inst, const DEVPROPKEY& key) {
+    wchar_t buf[256] = {};
+    ULONG sz = sizeof(buf) - sizeof(wchar_t);
+    DEVPROPTYPE type = 0;
+    if (CM_Get_DevNode_PropertyW(inst, &key, &type, reinterpret_cast<PBYTE>(buf), &sz, 0) != CR_SUCCESS ||
+        type != DEVPROP_TYPE_STRING)
+        return {};
+    return buf;
+}
 
 std::vector<BtNode> BtNodes() {
     std::vector<BtNode> out;
@@ -106,7 +117,11 @@ std::vector<BtNode> BtNodes() {
             type != DEVPROP_TYPE_GUID)
             continue;
         std::string mac = MacFromInstanceId(p);
-        if (!mac.empty()) out.push_back({g, mac});
+        if (mac.empty()) continue;
+        std::wstring upper(p);
+        for (auto& c : upper) c = (wchar_t)towupper(c);
+        const bool sink = upper.find(L"{0000110B-0000-1000-8000-00805F9B34FB}") != std::wstring::npos;
+        out.push_back({g, mac, sink ? DevString(inst, DEVPKEY_Device_DriverProvider) : std::wstring()});
     }
     return out;
 }
@@ -245,8 +260,8 @@ std::vector<Endpoint> Audio::RenderEndpoints() const {
                     }
                     for (const auto& n : nodes)
                         if (IsEqualGUID(n.container, *pv.v.puuid)) {
-                            ep.btMac = n.mac;
-                            break;
+                            if (ep.btMac.empty()) ep.btMac = n.mac;
+                            if (!n.a2dpProvider.empty()) ep.a2dpDriver = n.a2dpProvider;
                         }
                 }
 

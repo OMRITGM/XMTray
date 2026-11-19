@@ -235,6 +235,7 @@ struct Endpoint {
     std::wstring id;   // IMMDevice id
     std::wstring name; // friendly name
     std::string btMac; // "AA:BB:CC:DD:EE:FF" if this endpoint is a Bluetooth A2DP device, else ""
+    std::wstring a2dpDriver; // driver provider of its A2DP sink node ("Microsoft" = inbox), "" if unknown
     bool isDefault = false;
     int sampleRate = 0, bits = 0, channels = 0; // shared-mode device format, 0 if unknown
 };

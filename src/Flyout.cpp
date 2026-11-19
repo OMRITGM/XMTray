@@ -31,7 +31,7 @@ namespace {
 
 // ---- constants (DIP) ----------------------------------------------------------------------
 constexpr wchar_t kClass[] = L"XMTrayFlyout";
-constexpr wchar_t kVersion[] = L"0.3.1";
+constexpr wchar_t kVersion[] = L"0.3.2";
 constexpr DWORD kStyle = WS_OVERLAPPEDWINDOW;
 constexpr int kDefW = 940, kDefH = 640, kMinW = 820, kMinH = 560;
 constexpr float SB = 200.f;     // sidebar width
@@ -53,7 +53,7 @@ enum : int {
     ID_POWER = 290, ID_POWER_OK, ID_POWER_NO, ID_RETRY, ID_BTSET,
     ID_HOST = 300, ID_EQP = 400, ID_BAND = 450, ID_CB = 470, ID_FLAT, ID_NAME, ID_SAVE,
     ID_UP = 500, ID_RENAME = 700, ID_REN_OK, ID_REN_NO, ID_DEL_OK, ID_DEL_NO,
-    ID_DOLBY_TOG = 720, ID_DOLBY_OPEN, ID_DOLBY_RESET, ID_DOLBY_AUTO, ID_LDAC_HELP, ID_DMODE = 740,
+    ID_DOLBY_TOG = 720, ID_DOLBY_OPEN, ID_DOLBY_RESET, ID_DOLBY_AUTO, ID_LDAC_HELP, ID_LDAC_GET, ID_DMODE = 740,
     ID_SET = 800, ID_STEP_DN = 820, ID_STEP_UP, ID_LOG, ID_QUIT, ID_ALERT_NO = 850, ID_ALERT_OK,
     ID_ADAPT = 900, ID_ADAPT_SENS = 910, ID_PREV = 950, ID_PLAYPAUSE, ID_NEXT,
     ID_NCBTN = 1000, ID_LMODE = 1050, ID_ROOM = 1100, ID_VA = 1150,
@@ -1524,14 +1524,35 @@ struct Flyout::Impl {
             Text(note, {x, y, x + w, y + nh + 2.f}, 12.5f, pal.text3, Reg, AlLeft, true);
             y += nh + 6.f;
         }
-        if (s.hasCodec && codec != Codec::LDAC) { // Windows has no LDAC encoder; an app cannot add one
-            const std::wstring note = L"Windows itself does not send LDAC. It needs a third-party Bluetooth driver "
-                                      L"or an LDAC USB transmitter.";
-            float nh = TextH(note, 12.5f, w);
-            Text(note, {x, y, x + w, y + nh + 2.f}, 12.5f, pal.text3, Reg, AlLeft, true);
-            y += nh + 8.f;
-            const std::wstring bl = L"How to get LDAC";
-            Button(ID_LDAC_HELP, {x, y, x + BtnW(bl), y + 34.f}, bl, [] {
+        // Windows has no LDAC encoder and an app cannot add one: LDAC needs a replacement A2DP driver. XMTray shows
+        // which driver the headphones' A2DP node uses and links to the vendor's page; it never downloads or installs.
+        const Endpoint* lep = FindEndpoint();
+        const bool btOut = lep && !lep->btMac.empty();
+        const bool altDriver = btOut && !lep->a2dpDriver.empty() && _wcsicmp(lep->a2dpDriver.c_str(), L"Microsoft") != 0;
+        if (btOut || (s.hasCodec && codec != Codec::LDAC)) {
+            std::wstring note;
+            if (altDriver)
+                note = L"A third-party Bluetooth audio driver is in use (" + lep->a2dpDriver +
+                       L"). Choose LDAC in its settings, then reconnect the headphones.";
+            else if (codec != Codec::LDAC)
+                note = L"Windows itself does not send LDAC. It needs a replacement Bluetooth audio driver (paid, from "
+                       L"its vendor) or an LDAC USB transmitter.";
+            if (!note.empty()) {
+                float nh = TextH(note, 12.5f, w);
+                Text(note, {x, y, x + w, y + nh + 2.f}, 12.5f, pal.text3, Reg, AlLeft, true);
+                y += nh + 8.f;
+            }
+            float bx = x;
+            if (btOut) {
+                const std::wstring dl = altDriver ? L"Update LDAC driver" : L"Install LDAC driver";
+                Button(ID_LDAC_GET, {bx, y, bx + BtnW(dl), y + 34.f}, dl, [] {
+                    ShellExecuteW(nullptr, L"open", L"https://www.bluetoothgoodies.com/a2dp/", nullptr, nullptr,
+                                  SW_SHOWNORMAL);
+                }, altDriver ? BtnNormal : BtnPrimary);
+                bx += BtnW(dl) + 8.f;
+            }
+            const std::wstring bl = L"LDAC guide";
+            Button(ID_LDAC_HELP, {bx, y, bx + BtnW(bl), y + 34.f}, bl, [] {
                 ShellExecuteW(nullptr, L"open", L"https://github.com/OMRITGM/XMTray/blob/main/docs/LDAC.md", nullptr,
                               nullptr, SW_SHOWNORMAL);
             }, BtnNormal);
@@ -1543,8 +1564,13 @@ struct Flyout::Impl {
         Divider(x, y, w);
         y = KV(x, y, w, L"Link format", info.format, pal.text);
         Divider(x, y, w);
-        const Endpoint* ep = FindEndpoint();
+        const Endpoint* ep = lep;
         y = KV(x, y, w, L"Windows output", ep ? ep->name : L"Not in use", ep ? pal.text : pal.warn);
+        if (ep && !ep->a2dpDriver.empty()) {
+            Divider(x, y, w);
+            y = KV(x, y, w, L"Bluetooth audio driver", altDriver ? ep->a2dpDriver : L"Windows built-in",
+                   altDriver ? pal.good : pal.text);
+        }
         if (!ep) return y - 6.f;
         y -= 6.f;
         std::wstring line;
