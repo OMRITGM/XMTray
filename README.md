@@ -18,7 +18,7 @@ Unofficial desktop control for Sony Bluetooth headphones on Windows 10/11: noise
 - Several headphones: pick one; optionally route Windows audio to it and follow the Windows output device
 - Multipoint: connected sources and playback switching (protocol v2 models)
 - Per-model controls: button / touch assignment, NC/AMB button cycle, adaptive ambient, listening modes, voice guidance, voice assistant, head gestures, automatic source switching, pairing mode, safe-listening level, playback control and track info
-- Spatial sound status (Off / Windows Sonic / Dolby Atmos for Headphones), an on/off attempt, and a shortcut to Dolby Access
+- Spatial sound status (Off / Windows Sonic / Dolby Atmos for Headphones), a shortcut to the headphones' spatial sound setting, and one to Dolby Access
 - Experimental, opt-in: switch Dolby Access sound modes (see "Dolby")
 - Notifications on connect, disconnect and low battery
 - Connects on demand; the control link is dropped shortly after the window is hidden
@@ -33,13 +33,13 @@ An app cannot add a Bluetooth codec to Windows. LDAC needs a third-party kernel 
 
 ### Dolby
 
-Windows exposes the active spatial sound format, which XMTray shows. Turning Dolby Atmos on or off is attempted through the documented API, which Windows may refuse for apps other than Dolby Access.
+Windows exposes the active spatial sound format, which XMTray shows. Windows lets only the app that owns a spatial format switch it (`SetDefaultSpatialAudioFormatAsync`), so "Turn on…" opens the headphones' own Windows sound settings page, where you pick Dolby Atmos for Headphones under Spatial sound.
 
 Dolby Access sound modes (Dynamic / Movie / Music / Game / Voice / Personalize) have no public interface. The experimental option (off by default) drives the Dolby Access window through UI Automation: it opens the app or uses its open window, moves it out of view, selects the mode by its exact name, confirms the change from Dolby's own log file, and puts the window back. It runs only while the selected headphones are the Windows default output with Dolby Atmos on. **The selection step has never been run end to end** (it needs Atmos enabled on an output); it will break when Dolby changes its app, and it fails closed when it does not recognise the layout.
 
 ## Install
 
-`XMTray-<version>-x64.msi`: per-machine install to `C:\Program Files\XMTray`, Start Menu shortcut, upgrades in place, closes a running XMTray before replacing it. Silent: `msiexec /i XMTray-0.3.0-x64.msi /qn` (a silent upgrade closes the running XMTray and does not restart it; it comes back at next sign-in if "Start with Windows" is on). Uninstall leaves `%LOCALAPPDATA%\XMTray` and the per-user Run value (if you enabled "Start with Windows") in place.
+`XMTray-<version>-x64.msi`: per-machine install to `C:\Program Files\XMTray`, Start Menu shortcut, upgrades in place, closes a running XMTray before replacing it. Silent: `msiexec /i XMTray-0.3.1-x64.msi /qn` (a silent upgrade closes the running XMTray and does not restart it; it comes back at next sign-in if "Start with Windows" is on). Uninstall leaves `%LOCALAPPDATA%\XMTray` and the per-user Run value (if you enabled "Start with Windows") in place.
 
 The exe and MSI are not code-signed, so SmartScreen shows "Unknown publisher" on first run. Signing needs a code-signing certificate (for example Azure Trusted Signing, or SignPath's free plan for public open-source repos); a self-signed certificate does not help on other machines. If an antivirus flags the file, submit it as a false positive to the vendor (Microsoft: https://www.microsoft.com/wdsi/filesubmission) rather than changing the binary to dodge detection.
 
@@ -55,7 +55,7 @@ build.cmd
 
 Output: `b\XMTray.exe`. `build.cmd` builds through a short `subst` drive because libmdr's object paths can exceed `MAX_PATH`, and applies `patches\libmdr-*.patch` to the submodule in name order: radio-handle and socket leaks in the Windows transport, a bounded receive buffer, NC/AMB button preservation on noise-control writes, and V1 Speak-to-Chat settings being overwritten with defaults.
 
-MSI: extract the [WiX 3.14.1 binaries](https://github.com/wixtoolset/wix3/releases/tag/wix3141rtm) to `tools\wix314\` (or set `WIX`), then `installer\build-msi.cmd 0.3.0` → `dist\XMTray-0.3.0-x64.msi`.
+MSI: extract the [WiX 3.14.1 binaries](https://github.com/wixtoolset/wix3/releases/tag/wix3141rtm) to `tools\wix314\` (or set `WIX`), then `installer\build-msi.cmd 0.3.1` → `dist\XMTray-0.3.1-x64.msi`.
 
 `XMTray.exe --demo` runs with a simulated headphone and no Bluetooth; `tools\shot.ps1` uses it to capture screenshots.
 

@@ -2,7 +2,7 @@
 <!-- WiX 3.14 (candle/light). Build with installer\build-msi.cmd; it passes -dVersion, -dExePath, -dLicensePath,
      -dReadmePath, -dRtfPath and (only if the file exists) -dIconPath, all absolute. The defaults below assume
      the working directory is R\installer. -->
-<?ifndef Version?><?define Version = "0.3.0"?><?endif?>
+<?ifndef Version?><?define Version = "0.3.1"?><?endif?>
 <?ifndef ExePath?><?define ExePath = "..\b\XMTray.exe"?><?endif?>
 <?ifndef LicensePath?><?define LicensePath = "..\LICENSE"?><?endif?>
 <?ifndef ReadmePath?><?define ReadmePath = "README.txt"?><?endif?>

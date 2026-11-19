@@ -289,7 +289,7 @@ struct DolbyState {
     bool spatialOn = false;      // some spatial sound format is active on the endpoint
     bool atmosOn = false;        // ... and it is Dolby Atmos for Headphones
     std::wstring formatName;     // e.g. "Dolby Atmos for Headphones", "Windows Sonic for Headphones", "Off"
-    bool canToggle = false;      // SetEnabled() is implemented on this system
+    bool canToggle = false;      // the output supports spatial sound: offer its Windows settings page
     bool canSetMode = false;     // SetMode() is implemented on this system
     int mode = -1;               // current value from `modes`, -1 if unknown
     std::vector<NamedInt> modes; // Dynamic / Movie / Music / Game / Voice / Personalize when canSetMode
@@ -309,7 +309,6 @@ public:
     Dolby& operator=(const Dolby&) = delete;
 
     DolbyState Get(const std::wstring& endpointId) const; // endpointId = IMMDevice id; "" = default output
-    bool SetEnabled(const std::wstring& endpointId, bool atmosOn);
     void SetAutomation(bool enabled); // experimental UI Automation of Dolby Access
     bool SetMode(int mode);           // true = switch started; result arrives via modeBusy/modeError/mode
     bool OpenApp() const; // launch Dolby Access (or its Store page if not installed)
@@ -351,7 +350,7 @@ struct AppHost {
     virtual void SelectDevice(const std::string& mac) = 0; // connect + (optionally) route audio
     virtual void Send(const Command& c) = 0;
     virtual DolbyState DolbyStatus() = 0;        // for the Windows output of the selected headphone
-    virtual void SetDolbyEnabled(bool on) = 0;
+    virtual void OpenSpatialSettings() = 0;     // Windows Settings page of that output (spatial sound format)
     virtual void SetDolbyMode(int mode) = 0;     // also flattens the headphone EQ per Config().resetEqOnDolbyMode
     virtual void OpenDolbyAccess() = 0;
     virtual Settings& Config() = 0;

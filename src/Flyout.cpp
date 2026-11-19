@@ -31,7 +31,7 @@ namespace {
 
 // ---- constants (DIP) ----------------------------------------------------------------------
 constexpr wchar_t kClass[] = L"XMTrayFlyout";
-constexpr wchar_t kVersion[] = L"0.3.0";
+constexpr wchar_t kVersion[] = L"0.3.1";
 constexpr DWORD kStyle = WS_OVERLAPPEDWINDOW;
 constexpr int kDefW = 940, kDefH = 640, kMinW = 820, kMinH = 560;
 constexpr float SB = 200.f;     // sidebar width
@@ -53,7 +53,7 @@ enum : int {
     ID_POWER = 290, ID_POWER_OK, ID_POWER_NO, ID_RETRY, ID_BTSET,
     ID_HOST = 300, ID_EQP = 400, ID_BAND = 450, ID_CB = 470, ID_FLAT, ID_NAME, ID_SAVE,
     ID_UP = 500, ID_RENAME = 700, ID_REN_OK, ID_REN_NO, ID_DEL_OK, ID_DEL_NO,
-    ID_DOLBY_TOG = 720, ID_DOLBY_OPEN, ID_DOLBY_RESET, ID_DOLBY_AUTO, ID_DMODE = 740,
+    ID_DOLBY_TOG = 720, ID_DOLBY_OPEN, ID_DOLBY_RESET, ID_DOLBY_AUTO, ID_LDAC_HELP, ID_DMODE = 740,
     ID_SET = 800, ID_STEP_DN = 820, ID_STEP_UP, ID_LOG, ID_QUIT, ID_ALERT_NO = 850, ID_ALERT_OK,
     ID_ADAPT = 900, ID_ADAPT_SENS = 910, ID_PREV = 950, ID_PLAYPAUSE, ID_NEXT,
     ID_NCBTN = 1000, ID_LMODE = 1050, ID_ROOM = 1100, ID_VA = 1150,
@@ -230,7 +230,6 @@ struct Flyout::Impl {
     std::wstring presetName, renameBuf, renameErr;
     ULONGLONG confirmAt = 0; // when a destructive confirm row was opened (double-click guard)
     wchar_t pendingHigh = 0; // high surrogate waiting for its low half
-    bool dolbyActing = false;
     D2D1_RECT_F ddAnchor{};
     // open list picker (Choice with many options): refreshed by the field on every paint, closed if it disappears
     int pickId = 0, pickVal = 0;
@@ -1525,6 +1524,19 @@ struct Flyout::Impl {
             Text(note, {x, y, x + w, y + nh + 2.f}, 12.5f, pal.text3, Reg, AlLeft, true);
             y += nh + 6.f;
         }
+        if (s.hasCodec && codec != Codec::LDAC) { // Windows has no LDAC encoder; an app cannot add one
+            const std::wstring note = L"Windows itself does not send LDAC. It needs a third-party Bluetooth driver "
+                                      L"or an LDAC USB transmitter.";
+            float nh = TextH(note, 12.5f, w);
+            Text(note, {x, y, x + w, y + nh + 2.f}, 12.5f, pal.text3, Reg, AlLeft, true);
+            y += nh + 8.f;
+            const std::wstring bl = L"How to get LDAC";
+            Button(ID_LDAC_HELP, {x, y, x + BtnW(bl), y + 34.f}, bl, [] {
+                ShellExecuteW(nullptr, L"open", L"https://github.com/OMRITGM/XMTray/blob/main/docs/LDAC.md", nullptr,
+                              nullptr, SW_SHOWNORMAL);
+            }, BtnNormal);
+            y += 40.f;
+        }
         y += 6.f;
         Divider(x, y, w);
         y = KV(x, y, w, L"Max bitrate", info.bitrate, pal.text);
@@ -2227,8 +2239,10 @@ struct Flyout::Impl {
         D2D1_RECT_F g{x, y, x + 56.f, y + 56.f};
         Fill(g, pal.accentSoft, 14.f);
         Icon(GSpatial, x + 28.f, y + 28.f, 32.f, pal.accentText);
+        const std::wstring tl = d.atmosOn ? L"Turn off…" : L"Turn on…";
+        const float tw = BtnW(tl);
         bool tog = d.canToggle && d.statusKnown;
-        float tr = tog ? x + w - 56.f : x + w;
+        float tr = tog ? x + w - tw - 12.f : x + w;
         std::wstring state = !d.statusKnown ? L"Unknown" : d.atmosOn ? L"On" : L"Off";
         Text(L"Dolby Atmos for Headphones", {x + 72.f, y + 2.f, tr, y + 28.f}, 17.f, pal.text, Semi);
         float cw = Chip(x + 72.f, y + 32.f, state, !d.statusKnown ? pal.text3 : d.atmosOn ? pal.good : pal.text3);
@@ -2236,21 +2250,9 @@ struct Flyout::Impl {
             Text(L"Active format: " + d.formatName, {x + 72.f + cw + 10.f, y + 32.f, tr, y + 58.f}, 12.5f, pal.text2);
         else if (!d.statusKnown)
             Text(L"Windows did not report the spatial sound state.", {x + 72.f + cw + 10.f, y + 32.f, tr, y + 58.f}, 12.5f, pal.text3);
-        if (tog) {
-            bool on = d.atmosOn;
-            D2D1_RECT_F sw{x + w - 44.f, y + 18.f, x + w, y + 40.f};
-            D2D1_RECT_F hit = Inflate(sw, 8.f);
-            if (Hot(ID_DOLBY_TOG)) Fill(hit, StateBg(ID_DOLBY_TOG, pal.card), 8.f);
-            Switch(sw, on, true, Hot(ID_DOLBY_TOG));
-            Add(ID_DOLBY_TOG, hit).click = [this, on] {
-                if (dolbyActing) return;
-                dolbyActing = true;
-                host.SetDolbyEnabled(!on);
-                dolby = host.DolbyStatus();
-                dolbyActing = false;
-            };
-            FocusRing(ID_DOLBY_TOG, hit, 8.f);
-        }
+        if (tog) // Windows allows only Dolby Access / Settings to switch the format: open this output's page
+            Button(ID_DOLBY_TOG, {x + w - tw, y + 9.f, x + w, y + 47.f}, tl, [this] { host.OpenSpatialSettings(); },
+                   d.atmosOn ? BtnNormal : BtnPrimary);
         y += 56.f;
         if (!d.endpointName.empty()) {
             Text(L"Output: " + d.endpointName, {x, y + 8.f, x + w, y + 28.f}, 12.5f, pal.text3);

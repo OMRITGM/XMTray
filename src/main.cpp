@@ -208,11 +208,12 @@ struct App final : AppHost {
         if (!s.modeBusy && pendingDolbyMode >= 0) FinishDolbyMode(s);
         return s;
     }
-    void SetDolbyEnabled(bool on) override {
+    // Windows lets only the format's owner app switch spatial sound, so send the user to that output's page.
+    void OpenSpatialSettings() override {
         const std::wstring id = TargetEndpoint();
-        if (demo || id.empty()) return; // never touch the default output or the system from demo mode
-        if (!dolby->SetEnabled(id, on)) Log(L"dolby: could not start the spatial sound switch");
-        flyout->Refresh();
+        if (demo) return;
+        const std::wstring uri = id.empty() ? L"ms-settings:sound" : L"ms-settings:sound-properties?endpointId=" + id;
+        ShellExecuteW(nullptr, L"open", uri.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     }
     void SetDolbyMode(int mode) override {
         if (demo || TargetEndpoint().empty() || !TargetIsDefaultOutput()) return;

@@ -1,5 +1,6 @@
-// Dolby.cpp - spatial sound status (read), asynchronous Atmos toggle, and an experimental sound-mode switch that
-// drives the Dolby Access window through UI Automation on a worker thread.
+// Dolby.cpp - spatial sound status (read only) and an experimental sound-mode switch that drives the Dolby Access
+// window through UI Automation on a worker thread. Windows lets only the app that owns a spatial format set it
+// (SetDefaultSpatialAudioFormatAsync), so turning Atmos on/off is left to Windows Settings / Dolby Access.
 #include "Core.h"
 
 #include <ole2.h>
@@ -18,7 +19,6 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <set>
 #include <thread>
 
@@ -40,7 +40,6 @@ constexpr wchar_t kAppId[] = L"DolbyLaboratories.DolbyAccess_rz1tebttyb220!App";
 constexpr wchar_t kAumid[] = L"shell:AppsFolder\\DolbyLaboratories.DolbyAccess_rz1tebttyb220!App";
 constexpr ULONGLONG kCacheMs = 1000;
 constexpr ULONGLONG kModeCacheMs = 3000;
-constexpr ULONGLONG kSetTimeoutMs = 15000;   // spatial format switch
 constexpr ULONGLONG kJobBudgetMs = 20000;    // whole UI Automation job
 constexpr ULONGLONG kStepTimeoutMs = 12000;  // waiting for the window / settings tab
 constexpr ULONGLONG kConfirmMs = 4000;
@@ -258,11 +257,7 @@ struct Shared {
     std::mutex m;
     std::condition_variable cv;
     bool running = false;    // a job thread is active
-    bool toggleBusy = false;
     bool modeBusy = false;
-    std::set<std::wstring> denied; // endpoint ids where Windows answered AccessDenied this session
-    std::wstring toggleEndpoint;   // endpoint of the last spatial format switch
-    std::wstring toggleNote;       // why it failed; empty if it worked
     std::wstring modeError;
     int mode = -1;           // parsed from the Dolby Access log
     ULONGLONG modeAt = 0;    // when `mode` was read successfully; 0 = read again
@@ -283,63 +278,6 @@ struct ComInit {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     ~ComInit() { if (SUCCEEDED(hr)) CoUninitialize(); }
 };
-
-// ---- job: switch the spatial sound format --------------------------------------------------------------------
-const wchar_t* StatusNote(wma::SetDefaultSpatialAudioFormatStatus s) {
-    using S = wma::SetDefaultSpatialAudioFormatStatus;
-    switch (s) {
-    case S::Succeeded: return L"";
-    case S::AccessDenied: return L"Windows did not allow XMTray to switch spatial sound for this output; use Dolby Access or Windows sound settings.";
-    case S::LicenseExpired: return L"The Dolby Atmos licence has expired — open Dolby Access.";
-    case S::LicenseNotValidForAudioEndpoint: return L"Dolby Atmos is not licensed for this output — open Dolby Access.";
-    case S::NotSupportedOnAudioEndpoint: return L"This output does not support that spatial sound format.";
-    default: return L"Windows could not switch spatial sound (unknown error).";
-    }
-}
-
-void RunToggle(std::shared_ptr<Shared> sh, std::wstring endpointId, bool on) {
-    using St = winrt::Windows::Foundation::AsyncStatus;
-    std::optional<wma::SetDefaultSpatialAudioFormatStatus> result;
-    std::wstring note;
-    {
-        ComInit com;
-        try {
-            auto cfg = ConfigFor(endpointId);
-            if (on) // informational only: returned false for every format on a licensed test machine
-                Log(L"Dolby: IsSpatialAudioFormatSupported(Atmos for Headphones) = %d",
-                    cfg.IsSpatialAudioFormatSupported(winrt::hstring(kAtmosHeadphones)) ? 1 : 0);
-            auto op = cfg.SetDefaultSpatialAudioFormatAsync(winrt::hstring(on ? kAtmosHeadphones : kOffGuid));
-            const ULONGLONG end = GetTickCount64() + kSetTimeoutMs;
-            St st = St::Started;
-            while ((st = op.wait_for(std::chrono::milliseconds(200))) == St::Started && !sh->cancel && GetTickCount64() < end) {}
-            if (st == St::Started) {
-                op.Cancel();
-                Log(L"Dolby: SetEnabled timed out or cancelled");
-                note = L"Windows did not finish switching spatial sound in time; try again or use Windows sound settings.";
-            } else if (st == St::Completed) {
-                result = op.GetResults().Status();
-                Log(L"Dolby: SetEnabled(%d) status %d", on ? 1 : 0, static_cast<int>(*result));
-                note = StatusNote(*result);
-            } else {
-                Log(L"Dolby: SetEnabled failed 0x%08X", static_cast<unsigned>(op.ErrorCode().value));
-                note = L"Switching spatial sound failed; try again or use Windows sound settings.";
-            }
-        } catch (const winrt::hresult_error& e) {
-            Log(L"Dolby: SetEnabled failed 0x%08X", static_cast<unsigned>(e.code().value));
-            note = L"Switching spatial sound failed; try again or use Windows sound settings.";
-        } catch (...) {
-            Log(L"Dolby: SetEnabled failed (unknown)");
-            note = L"Switching spatial sound failed; try again or use Windows sound settings.";
-        }
-    }
-    FinishJob(sh, [&](Shared& s) {
-        s.toggleBusy = false;
-        s.toggleEndpoint = endpointId;
-        s.toggleNote = note;
-        if (result == wma::SetDefaultSpatialAudioFormatStatus::AccessDenied) s.denied.insert(endpointId);
-        else if (result == wma::SetDefaultSpatialAudioFormatStatus::Succeeded) s.denied.erase(endpointId);
-    });
-}
 
 // ---- job: switch the Dolby sound mode through the Dolby Access window ----------------------------------------
 bool IsDolbyProcess(DWORD pid) {
@@ -856,7 +794,7 @@ struct Dolby::Impl {
             worker = std::thread(std::move(job));
         } catch (...) {
             std::lock_guard<std::mutex> lk(sh->m);
-            sh->running = sh->toggleBusy = sh->modeBusy = false;
+            sh->running = sh->modeBusy = false;
             return false;
         }
         cache.clear();
@@ -924,13 +862,9 @@ DolbyState Dolby::Get(const std::wstring& endpointId) const {
         const BaseState& b = it->second;
         DolbyState s = b.s;
 
-        bool toggleBusy, denied, refreshMode;
-        std::wstring toggleNote;
+        bool refreshMode;
         {
             std::lock_guard<std::mutex> lk(im.sh->m);
-            toggleBusy = im.sh->toggleBusy;
-            denied = im.sh->denied.count(endpointId) != 0;
-            if (im.sh->toggleEndpoint == endpointId) toggleNote = im.sh->toggleNote;
             s.modeBusy = im.sh->modeBusy;
             s.modeError = im.sh->modeError;
             refreshMode = im.automation && !im.sh->modeBusy && (im.sh->modeAt == 0 || now - im.sh->modeAt >= kModeCacheMs);
@@ -944,7 +878,7 @@ DolbyState Dolby::Get(const std::wstring& endpointId) const {
         }
 
         // Stable while a job runs: progress is reported through modeBusy and the note, not by hiding controls.
-        s.canToggle = s.appInstalled && s.statusKnown && b.supported && !denied;
+        s.canToggle = s.statusKnown && b.supported;
         s.canSetMode = im.automation && s.appInstalled && b.atmosActive;
         if (im.automation && s.appInstalled) {
             for (int i = 0; i < kModeCount; ++i) s.modes.push_back({i, kModeNames[i]});
@@ -955,8 +889,6 @@ DolbyState Dolby::Get(const std::wstring& endpointId) const {
         std::wstring note;
         if (!s.appInstalled) note += L"Dolby Access is not installed. ";
         if (!s.note.empty()) note += s.note + L" ";
-        if (toggleBusy) note += L"Switching spatial sound… ";
-        else if (!toggleNote.empty()) note += toggleNote + L" ";
         if (!im.automation)
             note += L"Sound modes (Dynamic, Movie, Music, Game, Voice) can only be changed in Dolby Access: Windows and "
                     L"Dolby provide no interface for other apps. An experimental option on this page can switch them by "
@@ -968,19 +900,6 @@ DolbyState Dolby::Get(const std::wstring& endpointId) const {
         return s;
     } catch (...) {
         return {};
-    }
-}
-
-bool Dolby::SetEnabled(const std::wstring& endpointId, bool atmosOn) {
-    try {
-        auto sh = impl_->sh;
-        const bool started = impl_->Start([sh, endpointId, atmosOn] { RunToggle(sh, endpointId, atmosOn); },
-                                          [](Shared& s) { s.toggleBusy = true; s.toggleNote.clear(); });
-        if (!started) Log(L"Dolby: SetEnabled ignored, a job is running");
-        return started;
-    } catch (...) {
-        Log(L"Dolby: SetEnabled failed to start");
-        return false;
     }
 }
 
