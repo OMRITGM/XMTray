@@ -2,6 +2,7 @@
 // drawn with Direct2D + DirectWrite in an immediate style. Every paint rebuilds a list of hit-testable items;
 // input is resolved against the last list. Cards are measured with a "dry" pass (no drawing) and then drawn.
 #include "Core.h"
+#include "resource.h"
 
 #include <windowsx.h>
 #include <shellapi.h>
@@ -30,7 +31,7 @@ namespace {
 
 // ---- constants (DIP) ----------------------------------------------------------------------
 constexpr wchar_t kClass[] = L"XMTrayFlyout";
-constexpr wchar_t kVersion[] = L"0.2.0";
+constexpr wchar_t kVersion[] = L"0.3.0";
 constexpr DWORD kStyle = WS_OVERLAPPEDWINDOW;
 constexpr int kDefW = 940, kDefH = 640, kMinW = 820, kMinH = 560;
 constexpr float SB = 200.f;     // sidebar width
@@ -264,6 +265,10 @@ struct Flyout::Impl {
         wc.hInstance = inst;
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         wc.lpszClassName = kClass;
+        wc.hIcon = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON,
+                                                 GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_SHARED));
+        wc.hIconSm = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON,
+                                                   GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED));
         RegisterClassExW(&wc); // fails harmlessly if already registered
         CreateWindowExW(0, kClass, L"XMTray", kStyle, CW_USEDEFAULT, CW_USEDEFAULT, kDefW, kDefH, nullptr, nullptr,
                         inst, this);

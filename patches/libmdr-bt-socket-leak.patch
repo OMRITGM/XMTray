@@ -1,0 +1,16 @@
+diff --git a/libmdr-bt/src/Windows/ConnectionWindows.cpp b/libmdr-bt/src/Windows/ConnectionWindows.cpp
+index 9a75fc6..33bf03c 100644
+--- a/libmdr-bt/src/Windows/ConnectionWindows.cpp
++++ b/libmdr-bt/src/Windows/ConnectionWindows.cpp
+@@ -29,6 +29,11 @@ struct MDRConnectionWindows
+         conn(INVALID_SOCKET)
+     {
+     }
++    // Destroying a connection that was never disconnected must not leak its socket.
++    ~MDRConnectionWindows() noexcept
++    {
++        CloseSocket();
++    }
+     static mdr::String ToU8String(const WCHAR* szMessage)
+     {
+         int size = WideCharToMultiByte(CP_UTF8, 0, szMessage, -1, NULL, 0, NULL, NULL);

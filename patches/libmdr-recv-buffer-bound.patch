@@ -1,0 +1,31 @@
+diff --git a/libmdr/src/Headphones.cpp b/libmdr/src/Headphones.cpp
+index ac54448..b74974d 100644
+--- a/libmdr/src/Headphones.cpp
++++ b/libmdr/src/Headphones.cpp
+@@ -244,8 +244,25 @@ namespace mdr
+             return idleCode;
+         auto commandBegin = std::find(mRecvBuf.begin(), mRecvBuf.end(), kStartMarker);
+         auto commandEnd = std::find(commandBegin, mRecvBuf.end(), kEndMarker);
++        // Start markers are escaped inside a frame, so a frame runs from the last one ahead of its end marker.
++        // Anything earlier is a stray marker or a frame that lost its end, and must not swallow this one.
++        for (auto it = commandEnd; it != commandBegin;)
++        {
++            if (*--it == kStartMarker)
++            {
++                commandBegin = it;
++                break;
++            }
++        }
+         if (commandBegin == mRecvBuf.end() || commandEnd == mRecvBuf.end())
+-            return idleCode; // Incomplete
++        {
++            // Incomplete. Bytes ahead of the last start marker never become a frame, nor does an unterminated
++            // frame this far beyond any real one: drop both, or a peer that never ends a frame grows this until OOM.
++            mRecvBuf.erase(mRecvBuf.begin(), commandBegin);
++            if (mRecvBuf.size() > kMDRMaxPacketSize * 64)
++                mRecvBuf.clear();
++            return idleCode;
++        }
+         MDRBuffer packedCommand{commandBegin, commandEnd + 1};
+         MDRBuffer command;
+         MDRDataType type;

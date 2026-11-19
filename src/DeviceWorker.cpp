@@ -1122,8 +1122,8 @@ struct DeviceWorker::Impl {
                                           Opt(MDR_ADAPTIVE_SENSITIVITY_HIGH, L"High")}};
                 EnsureOption(s.adaptiveSensitivity.options, s.adaptiveSensitivity.value, L"Not set");
             }
-            // NONE is also what libmdr reads for a device value it cannot map, and every noise-control write
-            // sends the button function back: never offer it, and leave such a device alone.
+            // NONE is also what libmdr reads for a device value it cannot map (patches/libmdr-nc-button-preserve
+            // keeps that raw value on noise-control writes): never offer it, and leave such a device alone.
             if (Has(MDR_FEATURE_NOISE_CONTROL_BUTTON) && n.button_mode != MDR_NOISE_BUTTON_NONE)
                 s.ncButton = {true,
                               static_cast<int>(n.button_mode),

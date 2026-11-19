@@ -1,0 +1,29 @@
+diff --git a/libmdr/src/Headphones.cpp b/libmdr/src/Headphones.cpp
+index edbaa40..ac54448 100644
+--- a/libmdr/src/Headphones.cpp
++++ b/libmdr/src/Headphones.cpp
+@@ -2802,9 +2802,12 @@ MDRResult mdrHeadphonesSetNoiseControl(MDRHeadphones* headphones, const MDRNoise
+         return MDR_RESULT_OK;
+     }
+     auto& state = h->mDetailsV2;
+-    mdr::v2::t1::Function button{};
++    // The button function is only written when its projection changes: NONE also stands for raw device values
++    // without an MDR_NOISE_BUTTON_* (e.g. QUICK_ATTENTION), which a write-back would reset to NO_FUNCTION.
++    auto button = state.mNcAsmButtonFunction.mDesired;
++    const bool buttonChanged = noiseControl->button_mode != from_protocol(button);
+     auto sensitivity = state.mNcAsmNoiseAdaptiveSensitivity.mDesired;
+-    if (!to_protocol(noiseControl->button_mode, button) ||
++    if ((buttonChanged && !to_protocol(noiseControl->button_mode, button)) ||
+         (noiseControl->adaptive_sensitivity != MDR_ADAPTIVE_SENSITIVITY_UNKNOWN &&
+          !to_protocol(noiseControl->adaptive_sensitivity, sensitivity)))
+         return MDR_RESULT_ERROR_INVALID_ARGUMENT;
+@@ -2814,7 +2817,8 @@ MDRResult mdrHeadphonesSetNoiseControl(MDRHeadphones* headphones, const MDRNoise
+     state.mNcAsmAmbientLevel.stage(static_cast<int>(noiseControl->ambient_level));
+     state.mNcAsmChangingAsmLevel.stage(noiseControl->changing_asm_level != MDR_FALSE);
+     state.mNcAsmFocusOnVoice.stage(noiseControl->focus_on_voice != MDR_FALSE);
+-    state.mNcAsmButtonFunction.stage(button);
++    if (buttonChanged)
++        state.mNcAsmButtonFunction.stage(button);
+     state.mNcAsmAutoAsmEnabled.stage(noiseControl->adaptive_ambient != MDR_FALSE);
+     state.mNcAsmNoiseAdaptiveSensitivity.stage(sensitivity);
+     return MDR_RESULT_OK;

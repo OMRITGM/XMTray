@@ -1,0 +1,70 @@
+diff --git a/libmdr/src/HeadphonesV1T1.cpp b/libmdr/src/HeadphonesV1T1.cpp
+index bdb480d..736af1f 100644
+--- a/libmdr/src/HeadphonesV1T1.cpp
++++ b/libmdr/src/HeadphonesV1T1.cpp
+@@ -530,20 +530,9 @@ namespace mdr
+                 }
+                 else
+                 {
+-                    if (notify)
+-                    {
+-                        Deserialize(NotifySystemExParamChildPayloadSmartTalkingModeExParamType1Param, result, cmd);
+-                        self->mDetailsV1.mSpeakToChatDetectSensitivity.overwrite(result.devectionSensitivity);
+-                        self->mDetailsV1.mSpeakToChatVoiceFocus = result.voiceFocus;
+-                        self->mDetailsV1.mSpeakToModeOutTime.overwrite(result.modeOutTime);
+-                    }
+-                    else
+-                    {
+-                        Deserialize(RetSystemExParamChildPayloadSmartTalkingModeExParamType1Param, result, cmd);
+-                        self->mDetailsV1.mSpeakToChatDetectSensitivity.overwrite(result.devectionSensitivity);
+-                        self->mDetailsV1.mSpeakToChatVoiceFocus = result.voiceFocus;
+-                        self->mDetailsV1.mSpeakToModeOutTime.overwrite(result.modeOutTime);
+-                    }
++                    // Not the on/off layout. The extended param has its own commands (HandleSystemExParam);
++                    // parsed here it always failed its command check, which ended the session.
++                    return MDR_EVENT_UNHANDLED;
+                 }
+                 return MDR_EVENT_SPEAK_TO_CHAT_CHANGED;
+             default:
+@@ -551,6 +540,31 @@ namespace mdr
+             }
+         }
+ 
++        // Speak-to-Chat sensitivity, voice focus and timeout arrive as SYSTEM_RET/NTFY_EXTENDED_PARAM. Unread,
++        // every Speak-to-Chat commit writes their defaults back over the device's values.
++        // A reply that does not parse, or is not the TYPE_1 layout the commit writes, is skipped, as all of
++        // them were before this was dispatched.
++        int HandleSystemExParam(MDRHeadphones* self, Span<const UInt8> cmd)
++        {
++            SystemInquiredType type{};
++            if (!detail::ReadEnumTag(cmd, type) || type != SystemInquiredType::SMART_TALKING_MODE)
++                return MDR_EVENT_UNHANDLED;
++            const auto apply = [self](const auto& result) -> int
++            {
++                if (!result || result.value.detailSettingType != SmartTalkingModeDetailSettingType::TYPE_1)
++                    return MDR_EVENT_UNHANDLED;
++                self->mDetailsV1.mSpeakToChatDetectSensitivity.overwrite(result.value.devectionSensitivity);
++                self->mDetailsV1.mSpeakToChatVoiceFocus = result.value.voiceFocus;
++                self->mDetailsV1.mSpeakToModeOutTime.overwrite(result.value.modeOutTime);
++                return MDR_EVENT_SPEAK_TO_CHAT_CHANGED;
++            };
++            if (static_cast<Command>(cmd[0]) == Command::SYSTEM_NTFY_EXTENDED_PARAM)
++                return apply((NotifySystemExParamChildPayloadSmartTalkingModeExParamType1Param::Deserialize)(
++                    cmd.data(), cmd.size()));
++            return apply(
++                (RetSystemExParamChildPayloadSmartTalkingModeExParamType1Param::Deserialize)(cmd.data(), cmd.size()));
++        }
++
+         int HandleAlertParam(MDRHeadphones* self, Span<const UInt8> cmd)
+         {
+             AlertInquiredType type{};
+@@ -640,6 +654,9 @@ namespace mdr
+         case Command::SYSTEM_RET_PARAM:
+         case Command::SYSTEM_NTFY_PARAM:
+             return HandleSystemParam(self, cmd);
++        case Command::SYSTEM_RET_EXTENDED_PARAM:
++        case Command::SYSTEM_NTFY_EXTENDED_PARAM:
++            return HandleSystemExParam(self, cmd);
+         case Command::ALERT_NTFY_PARAM:
+             return HandleAlertParam(self, cmd);
+         default:

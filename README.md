@@ -37,6 +37,12 @@ Windows exposes the active spatial sound format, which XMTray shows. Turning Dol
 
 Dolby Access sound modes (Dynamic / Movie / Music / Game / Voice / Personalize) have no public interface. The experimental option (off by default) drives the Dolby Access window through UI Automation: it opens the app or uses its open window, moves it out of view, selects the mode by its exact name, confirms the change from Dolby's own log file, and puts the window back. It runs only while the selected headphones are the Windows default output with Dolby Atmos on. **The selection step has never been run end to end** (it needs Atmos enabled on an output); it will break when Dolby changes its app, and it fails closed when it does not recognise the layout.
 
+## Install
+
+`XMTray-<version>-x64.msi`: per-machine install to `C:\Program Files\XMTray`, Start Menu shortcut, upgrades in place, closes a running XMTray before replacing it. Silent: `msiexec /i XMTray-0.3.0-x64.msi /qn` (a silent upgrade closes the running XMTray and does not restart it; it comes back at next sign-in if "Start with Windows" is on). Uninstall leaves `%LOCALAPPDATA%\XMTray` and the per-user Run value (if you enabled "Start with Windows") in place.
+
+The exe and MSI are not code-signed, so SmartScreen shows "Unknown publisher" on first run. Signing needs a code-signing certificate (for example Azure Trusted Signing, or SignPath's free plan for public open-source repos); a self-signed certificate does not help on other machines. If an antivirus flags the file, submit it as a false positive to the vendor (Microsoft: https://www.microsoft.com/wdsi/filesubmission) rather than changing the binary to dodge detection.
+
 ## Build
 
 Requirements: Visual Studio 2022 Build Tools (C++ workload, CMake ≥ 3.31, Ninja) and git.
@@ -47,7 +53,9 @@ cd XMTray
 build.cmd
 ```
 
-Output: `b\XMTray.exe`. `build.cmd` builds through a short `subst` drive because libmdr's object paths can exceed `MAX_PATH`, and applies `patches\libmdr-bt-handle-leak.patch` to the submodule (a radio-handle leak in device enumeration).
+Output: `b\XMTray.exe`. `build.cmd` builds through a short `subst` drive because libmdr's object paths can exceed `MAX_PATH`, and applies `patches\libmdr-*.patch` to the submodule in name order: radio-handle and socket leaks in the Windows transport, a bounded receive buffer, NC/AMB button preservation on noise-control writes, and V1 Speak-to-Chat settings being overwritten with defaults.
+
+MSI: extract the [WiX 3.14.1 binaries](https://github.com/wixtoolset/wix3/releases/tag/wix3141rtm) to `tools\wix314\` (or set `WIX`), then `installer\build-msi.cmd 0.3.0` → `dist\XMTray-0.3.0-x64.msi`.
 
 `XMTray.exe --demo` runs with a simulated headphone and no Bluetooth; `tools\shot.ps1` uses it to capture screenshots.
 

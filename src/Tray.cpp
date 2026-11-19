@@ -1,5 +1,6 @@
 // Tray.cpp - notification-area icon (battery digits / headphone glyph), tooltip, toast, context menu.
 #include "Core.h"
+#include "resource.h"
 #include <shellapi.h>
 #include <algorithm>
 #include <cstdio>
@@ -217,7 +218,8 @@ struct Tray::Impl {
 
 Tray::Tray(HWND owner) : impl_(new Impl) {
     impl_->owner = owner;
-    impl_->appIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1));
+    impl_->appIcon = static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED));
     NOTIFYICONDATAW& n = impl_->nid;
     n.cbSize = sizeof(n);
     n.hWnd = owner;
@@ -226,7 +228,7 @@ Tray::Tray(HWND owner) : impl_(new Impl) {
     n.uCallbackMessage = WM_XM_TRAY;
     impl_->key = {Glyph::Headphones, 0, false, TaskbarIsLight(), impl_->IconSize()};
     impl_->icon = MakeIcon(impl_->key);
-    n.hIcon = impl_->icon ? impl_->icon : LoadIconW(nullptr, IDI_APPLICATION);
+    n.hIcon = impl_->icon ? impl_->icon : impl_->appIcon;
     impl_->tip = L"XMTray — no headphones connected";
     impl_->FillTip(impl_->tip);
     impl_->Add();
